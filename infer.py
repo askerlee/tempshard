@@ -14,16 +14,16 @@ from recirculation import RecirculationConfig, recirculate
 
 
 EXAMPLE_QUERIES = (
-    "Explain why the sky is blue.",
-    "A red ball is in a box. The box is moved into a closet. Where is the red ball now?",
-    "Maya gave the book to Liam after he finished the puzzle. Who finished the puzzle?",
-    "If the first word is an animal, answer FIRST; if the second word is an animal, answer SECOND. Words: violin tiger.",
-    "A train leaves at 9:15 AM and travels for 2 hours and 45 minutes. What time does it arrive?",
-    "Fred took his fishing pole to the bank of a river. Is Fred likely to find an ATM at this bank? Explain briefly.",
-    "All roses are flowers. Some flowers fade quickly. Can we conclude that some roses fade quickly? Explain.",
-    "The meeting was moved from Tuesday to Friday, then moved two days earlier. On what day is the meeting?",
-    "Plan three concise steps for making tea when the kettle is empty and the mug is dirty.",
-    "A store discounts a $80 jacket by 25%, then adds 10% sales tax. What is the final price?",
+    "Explain why the daytime sky is blue but sunsets often appear red. Connect the explanation to scattering, wavelength, and the distance sunlight travels through the atmosphere.",
+    "A city wants to reduce downtown traffic without making commuting harder for low-income workers. Compare congestion pricing, improved public transit, and parking restrictions, then recommend a phased policy with safeguards and measurable success criteria.",
+    "Maya manages a project originally due Friday. The client moves it to Wednesday, an engineer reports a two-day blocker, and a required reviewer is unavailable Tuesday. Develop a realistic recovery plan, identify assumptions, and explain what Maya should communicate to each stakeholder.",
+    "A company claims that productivity increased after employees returned to the office, so remote work must reduce productivity. Critique this inference, propose plausible confounders, and design a stronger evaluation that could support a causal conclusion.",
+    "Design a fair procedure for allocating five emergency shelter beds among twelve eligible people when needs differ and information is incomplete. Explain the values behind your procedure and how appeals or new evidence should be handled.",
+    "Fred took his fishing pole to the bank of a river. Later, a friend texted that she would meet him at the bank to discuss a loan. Analyze the ambiguity, explain which interpretation each person may hold, and propose a message that prevents a costly misunderstanding.",
+    "All roses are flowers, some flowers fade quickly, and no quickly fading plant survives a frost. Explain exactly what can and cannot be inferred about roses, then give two additional premises that would support different conclusions.",
+    "A small software team must choose between shipping a fragile feature this week or delaying it for testing while a competitor is launching a similar product. Build a decision framework, evaluate the main risks, and recommend a course of action under clearly stated assumptions.",
+    "Plan how to prepare tea for six guests when there is one kettle, four clean mugs, two dirty mugs, and one guest avoids caffeine. Include ordering, resource constraints, and a contingency if the kettle stops working.",
+    "A store is considering a 25% discount followed by a loyalty reward, but margins are thin and customers respond differently to promotions. Explain how the store should evaluate profitability, customer behavior, and long-term effects before choosing a promotion design.",
 )
 
 
@@ -51,9 +51,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B-FP8")
     parser.add_argument("--destination", type=int, default=4)
-    parser.add_argument("--source", type=int, default=12)
+    parser.add_argument(
+        "--source",
+        type=int,
+        default=-1,
+        help="Source block index; -1 selects the last block (default: -1).",
+    )
     # alpha: weight of the source residual stream in the convex combination. 
-    parser.add_argument("--alpha", type=float, default=0.15)
+    parser.add_argument("--alpha", type=float, default=0.5)
     # beta: weight of the destination residual stream in the convex combination. 
     # If None, defaults to 1 - alpha.
     parser.add_argument(
@@ -62,7 +67,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Defaults to 1 - alpha.",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=400)
+    parser.add_argument("--max-new-tokens", type=int, default=300)
+    parser.add_argument(
+        "--skip-baseline",
+        action="store_true",
+        help="Skip the Recirculation OFF generation run.",
+    )
     parser.add_argument(
         "--tempshard",
         type=int,
@@ -103,6 +113,10 @@ def choose_device(requested: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def resolve_source(source: int, num_blocks: int) -> int:
+    return num_blocks - 1 if source == -1 else source
 
 
 def find_decoder_blocks(model: nn.Module) -> Sequence[nn.Module]:
@@ -262,13 +276,9 @@ def main() -> None:
     input_device = model.get_input_embeddings().weight.device
 
     blocks = find_decoder_blocks(model)
-    expert_shards = TemporalExpertShards(blocks, args.seed) if args.tempshard == 2 else None
-    if expert_shards is not None and not expert_shards.is_moe:
-        expert_shards.close()
-        expert_shards = None
     config = RecirculationConfig(
         destination=args.destination,
-        source=args.source,
+        source=resolve_source(args.source, len(blocks)),
         alpha=args.alpha,
         beta=args.beta,
     )
@@ -277,6 +287,14 @@ def main() -> None:
             f"The model has {len(blocks)} decoder blocks, but the requested "
             f"indices were destination={config.destination}, source={config.source}."
         )
+    expert_shards = (
+        TemporalExpertShards(blocks[config.destination :], args.seed)
+        if args.tempshard == 2
+        else None
+    )
+    if expert_shards is not None and not expert_shards.is_moe:
+        expert_shards.close()
+        expert_shards = None
 
     def step(token: Tensor, cache: DynamicCache) -> tuple[Tensor, DynamicCache]:
         past_length = cache.get_seq_length()
@@ -384,15 +402,21 @@ def main() -> None:
         return generated_ids, time.perf_counter() - start
 
     prompt_length = input_ids.shape[1]
-    baseline_ids, baseline_seconds = timed_generate(use_recirculation=False)
-    print(f"=== Recirculation OFF ({baseline_seconds:.3f} s) ===")
-    print(tokenizer.decode(baseline_ids[0, prompt_length:], skip_special_tokens=True))
+    if not args.skip_baseline:
+        baseline_ids, baseline_seconds = timed_generate(use_recirculation=False)
+        print(f"=== Recirculation OFF ({baseline_seconds:.3f} s) ===")
+        print(
+            tokenizer.decode(
+                baseline_ids[0, prompt_length:], skip_special_tokens=True
+            )
+        )
 
     recirculated_ids, recirculated_seconds = timed_generate(use_recirculation=True)
     if expert_shards is not None:
         expert_shards.close()
 
-    print(f"\n=== Recirculation ON ({recirculated_seconds:.3f} s) ===")
+    heading_prefix = "" if args.skip_baseline else "\n"
+    print(f"{heading_prefix}=== Recirculation ON ({recirculated_seconds:.3f} s) ===")
     print(
         tokenizer.decode(
             recirculated_ids[0, prompt_length:], skip_special_tokens=True
