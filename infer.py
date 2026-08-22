@@ -149,6 +149,14 @@ def find_decoder_blocks(model: nn.Module) -> Sequence[nn.Module]:
     )
 
 
+def resolve_shared_expert_count(num_experts: int, overlap: float) -> int:
+    target = num_experts * overlap
+    shared_count = round(target)
+    if (num_experts - shared_count) % 2 != 0:
+        shared_count += 1 if target > shared_count else -1
+    return shared_count
+
+
 class TemporalExpertShards:
     def __init__(
         self, blocks: Sequence[nn.Module], seed: int, overlap: float = 0.25
@@ -174,13 +182,8 @@ class TemporalExpertShards:
                 and isinstance(top_k, int)
             ):
                 continue
-            shared_count = round(num_experts * overlap)
+            shared_count = resolve_shared_expert_count(num_experts, overlap)
             exclusive_count = num_experts - shared_count
-            if exclusive_count % 2 != 0:
-                raise ValueError(
-                    f"Cannot split {num_experts} experts evenly with overlap {overlap}; "
-                    "the non-shared expert count must be even."
-                )
             shard_size = shared_count + exclusive_count // 2
             if top_k > shard_size:
                 raise ValueError(
