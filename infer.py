@@ -80,6 +80,12 @@ def parse_args() -> argparse.Namespace:
         help="Temporarily split MoE experts into this many shards; 2 is supported.",
     )
     parser.add_argument(
+        "--expert-overlap",
+        type=float,
+        default=0.2,
+        help="Fraction of experts shared by both temporal shards (default: 0.25).",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
@@ -144,7 +150,11 @@ def find_decoder_blocks(model: nn.Module) -> Sequence[nn.Module]:
 
 
 class TemporalExpertShards:
-    def __init__(self, blocks: Sequence[nn.Module], seed: int) -> None:
+    def __init__(
+        self, blocks: Sequence[nn.Module], seed: int, overlap: float = 0.25
+    ) -> None:
+        if not 0.0 <= overlap < 1.0:
+            raise ValueError("Expert overlap must be in the range [0, 1).")
         self._enabled = False
         self._subset = 0
         self._expert_subsets: dict[nn.Module, tuple[Tensor, Tensor]] = {}
@@ -164,22 +174,35 @@ class TemporalExpertShards:
                 and isinstance(top_k, int)
             ):
                 continue
-            if num_experts % 2 != 0:
+            shared_count = round(num_experts * overlap)
+            exclusive_count = num_experts - shared_count
+            if exclusive_count % 2 != 0:
                 raise ValueError(
-                    f"Cannot split a layer's {num_experts} experts evenly into two subsets."
+                    f"Cannot split {num_experts} experts evenly with overlap {overlap}; "
+                    "the non-shared expert count must be even."
                 )
-            if top_k > num_experts // 2:
+            shard_size = shared_count + exclusive_count // 2
+            if top_k > shard_size:
                 raise ValueError(
                     f"The router selects {top_k} experts, but each temporal shard "
-                    f"contains only {num_experts // 2}."
+                    f"contains only {shard_size}."
                 )
 
             permutation = torch.randperm(num_experts, generator=generator)
-            subsets = permutation[: num_experts // 2], permutation[num_experts // 2 :]
+            shared = permutation[:shared_count]
+            exclusive = permutation[shared_count:]
+            split = exclusive_count // 2
+            subsets = (
+                torch.cat((shared, exclusive[:split])),
+                torch.cat((shared, exclusive[split:])),
+            )
             self._expert_subsets[router] = subsets
             self._handles.append(router.register_forward_hook(self._route_with_subset))
 
-        print(f"Temporal expert sharding experts into 2 subsets for {len(self._handles)} MoE layers. ")
+        print(
+            f"Temporal expert sharding with {overlap:.0%} overlap for "
+            f"{len(self._handles)} MoE layers."
+        )
 
     @property
     def is_moe(self) -> bool:
@@ -252,6 +275,8 @@ def main() -> None:
         raise ValueError("--max-new-tokens must be nonnegative.")
     if args.temperature < 0:
         raise ValueError("--temperature must be nonnegative.")
+    if not 0.0 <= args.expert_overlap < 1.0:
+        raise ValueError("--expert-overlap must be in the range [0, 1).")
 
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
@@ -288,7 +313,9 @@ def main() -> None:
             f"indices were destination={config.destination}, source={config.source}."
         )
     expert_shards = (
-        TemporalExpertShards(blocks[config.destination :], args.seed)
+        TemporalExpertShards(
+            blocks[config.destination :], args.seed, args.expert_overlap
+        )
         if args.tempshard == 2
         else None
     )
