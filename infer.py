@@ -50,12 +50,12 @@ def parse_args() -> argparse.Namespace:
         help="Print the built-in queries and exit.",
     )
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B-FP8")
-    parser.add_argument("--destination", type=int, default=4)
+    parser.add_argument("--destination", type=int, default=3)
     parser.add_argument(
         "--source",
         type=int,
-        default=-1,
-        help="Source block index; -1 selects the last block (default: -1).",
+        default=-4,
+        help="Source block index; -n selects the nth-to-last block (default: -4).",
     )
     # alpha: weight of the source residual stream in the convex combination. 
     parser.add_argument("--alpha", type=float, default=0.5)
@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         "--expert-overlap",
         type=float,
         default=0.2,
-        help="Fraction of experts shared by both temporal shards (default: 0.25).",
+        help="Fraction of experts shared by both temporal shards (default: 0.2).",
     )
     parser.add_argument(
         "--temperature",
@@ -122,7 +122,7 @@ def choose_device(requested: str) -> torch.device:
 
 
 def resolve_source(source: int, num_blocks: int) -> int:
-    return num_blocks - 1 if source == -1 else source
+    return num_blocks + source if source < 0 else source
 
 
 def find_decoder_blocks(model: nn.Module) -> Sequence[nn.Module]:
