@@ -57,12 +57,6 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Source block index; -1 selects the last block (default: -1).",
     )
-    parser.add_argument(
-        "--mode",
-        choices=("source", "layerwise"),
-        default="source",
-        help="Use source-to-destination recirculation or loop every layer twice.",
-    )
     # alpha: weight of the source residual stream in the convex combination. 
     parser.add_argument("--alpha", type=float, default=0.5)
     # beta: weight of the destination residual stream in the convex combination. 
@@ -266,18 +260,6 @@ def rewind_dynamic_cache(cache: DynamicCache) -> DynamicCache:
     return cache
 
 
-def rewind_dynamic_cache_layer(
-    cache: DynamicCache, layer_index: int
-) -> DynamicCache:
-    layer = cache.layers[layer_index]
-    crop_parameter = next(iter(inspect.signature(layer.crop).parameters.values()))
-    if crop_parameter.name == "tokens_to_remove":
-        layer.crop(-1)
-    else:
-        layer.crop(layer.get_seq_length() - 1)
-    return cache
-
-
 def sample_token(logits: Tensor, temperature: float) -> Tensor:
     if temperature <= 0:
         return logits.argmax(dim=-1, keepdim=True)
@@ -327,21 +309,15 @@ def main() -> None:
         source=resolve_source(args.source, len(blocks)),
         alpha=args.alpha,
         beta=args.beta,
-        mode=args.mode,
     )
     if not 0 <= config.destination < config.source < len(blocks):
         raise ValueError(
             f"The model has {len(blocks)} decoder blocks, but the requested "
             f"indices were destination={config.destination}, source={config.source}."
         )
-    sharded_blocks = (
-        blocks[config.destination : config.source + 1]
-        if config.mode == "layerwise"
-        else blocks[config.destination :]
-    )
     expert_shards = (
         TemporalExpertShards(
-            sharded_blocks, args.seed, args.expert_overlap
+            blocks[config.destination :], args.seed, args.expert_overlap
         )
         if args.tempshard == 2
         else None
@@ -411,7 +387,6 @@ def main() -> None:
                 rewind_one=rewind_dynamic_cache,
                 config=config,
                 select_expert_subset=expert_shards.select if expert_shards else None,
-                rewind_layer=rewind_dynamic_cache_layer,
             )
             next_logits = prompt_logits[:, -1, :]
         else:
@@ -437,7 +412,6 @@ def main() -> None:
                     rewind_one=rewind_dynamic_cache,
                     config=config,
                     select_expert_subset=expert_shards.select if expert_shards else None,
-                    rewind_layer=rewind_dynamic_cache_layer,
                 )
             else:
                 token_logits, cache = step(next_token, cache)
