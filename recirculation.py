@@ -2,7 +2,7 @@
    Originally implemented by Benhao Huang:
    https://gist.github.com/huskydoge/1ff29693e2172226ec26081f208b19d6
 
-For every token (with three passes):
+In source-to-destination mode, for every token (with three passes):
   1. Run a normal cached pass; return its logits and save residuals h_d, h_s.
   2. Rewind the KV cache by one position.
   3. Run the token again, replacing the output of destination block d with
@@ -10,16 +10,22 @@ For every token (with three passes):
     4. Capture the new residuals, rewind, and repeat the recirculation once more.
     5. Ignore the recirculated logits and commit the final-pass KV cache.
 
-``step(token, cache)`` and ``rewind_one(cache)`` are model-specific adapters.
-Block indices are zero-based outputs, so the mixture is injected as the input
-to block d + 1. This is the serial reference, not the paper's serving pipeline.
+In layerwise mode, each block from destination through source is run ``passes``
+times in place, feeding each pass output into the next pass after matching the
+original input norm. Each extra pass replaces that layer's previous KV entry,
+so the cache advances once per token.
+
+``step(token, cache)``, ``rewind_one(cache)``, and
+``rewind_layer(cache, layer_index)`` are model-specific adapters. Block indices
+are zero-based outputs, so the mixture is injected as the input to block d + 1.
+This is the serial reference, not the paper's serving pipeline.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import Tensor, nn
@@ -32,6 +38,7 @@ class RecirculationConfig:
     alpha: float
     beta: float | None = None  # None selects the convex mix: beta = 1 - alpha.
     eps: float = 1e-8
+    mode: Literal["source", "layerwise"] = "source"
 
 
 def _residual(output: Any) -> Tensor:
@@ -84,6 +91,91 @@ class _Hooks:
             handle.remove()
 
 
+class _LayerwiseHooks:
+    def __init__(
+        self,
+        blocks: Sequence[nn.Module],
+        config: RecirculationConfig,
+        cache: Any,
+        rewind_layer: Callable[[Any, int], Any],
+        passes: int,
+        select_expert_subset: Callable[[int], None] | None,
+    ) -> None:
+        if not 0 <= config.destination < config.source < len(blocks):
+            raise ValueError("Expected 0 <= destination < source < number of blocks.")
+        self.cache = cache
+        self.rewind_layer = rewind_layer
+        self.passes = passes
+        self.eps = config.eps
+        self.select_expert_subset = select_expert_subset
+        self.replaying = False
+        self.handles = tuple(
+            block.register_forward_hook(
+                self._repeat_layer(layer_index), with_kwargs=True
+            )
+            for layer_index, block in enumerate(
+                blocks[config.destination : config.source + 1],
+                start=config.destination,
+            )
+        )
+
+    def _repeat_layer(self, layer_index: int) -> Callable[..., Any]:
+        def repeat(
+            module: nn.Module,
+            inputs: tuple[Any, ...],
+            kwargs: dict[str, Any],
+            output: Any,
+        ) -> Any:
+            if self.replaying:
+                return output
+
+            original_input = _residual(inputs if inputs else kwargs["hidden_states"])
+            original_norm = torch.linalg.vector_norm(
+                original_input.to(dtype=torch.float32), dim=-1, keepdim=True
+            )
+            repeated_output = output
+            for pass_index in range(1, self.passes):
+                hidden = _residual(repeated_output)
+                hidden_float = hidden.to(dtype=torch.float32)
+                hidden = (
+                    hidden_float
+                    * original_norm
+                    / torch.linalg.vector_norm(
+                        hidden_float, dim=-1, keepdim=True
+                    ).clamp_min(self.eps)
+                ).to(dtype=hidden.dtype)
+                if inputs:
+                    repeated_inputs = (hidden, *inputs[1:])
+                    repeated_kwargs = kwargs
+                elif "hidden_states" in kwargs:
+                    repeated_inputs = inputs
+                    repeated_kwargs = {**kwargs, "hidden_states": hidden}
+                else:
+                    raise TypeError(
+                        "A transformer block must receive its residual stream as "
+                        "the first argument or as hidden_states."
+                    )
+
+                self.cache = self.rewind_layer(self.cache, layer_index)
+                if self.select_expert_subset is not None:
+                    self.select_expert_subset(pass_index)
+                self.replaying = True
+                try:
+                    repeated_output = module(*repeated_inputs, **repeated_kwargs)
+                finally:
+                    self.replaying = False
+
+            if self.select_expert_subset is not None:
+                self.select_expert_subset(0)
+            return repeated_output
+
+        return repeat
+
+    def close(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+
+
 @torch.inference_mode()
 def recirculate(
     input_ids: Tensor,
@@ -95,11 +187,38 @@ def recirculate(
     config: RecirculationConfig,
     select_expert_subset: Callable[[int], None] | None = None,
     passes: int = 3,
+    rewind_layer: Callable[[Any, int], Any] | None = None,
 ) -> tuple[Tensor, Any]:
-    """Return first-pass logits and the final-pass cache."""
+    """Run source-to-destination recirculation or layerwise repeated passes."""
 
     if passes < 1:
         raise ValueError("passes must be at least 1.")
+
+    if config.mode == "layerwise":
+        if rewind_layer is None:
+            raise ValueError("Layerwise mode requires rewind_layer.")
+        logits = []
+        hooks = _LayerwiseHooks(
+            blocks,
+            config,
+            cache,
+            rewind_layer,
+            passes,
+            select_expert_subset,
+        )
+        try:
+            for position in range(input_ids.shape[1]):
+                token = input_ids[:, position : position + 1]
+                if select_expert_subset is not None:
+                    select_expert_subset(0)
+                token_logits, cache = step(token, hooks.cache)
+                hooks.cache = cache
+                logits.append(token_logits)
+        finally:
+            if select_expert_subset is not None:
+                select_expert_subset(0)
+            hooks.close()
+        return torch.cat(logits, dim=1), hooks.cache
 
     logits = []
     hooks = _Hooks(blocks, config)

@@ -4,6 +4,7 @@ import argparse
 import inspect
 import time
 from collections.abc import Sequence
+from itertools import combinations
 from typing import Any
 
 import torch
@@ -50,12 +51,18 @@ def parse_args() -> argparse.Namespace:
         help="Print the built-in queries and exit.",
     )
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B-FP8")
-    parser.add_argument("--destination", type=int, default=3)
+    parser.add_argument("--destination", type=int, default=4)
     parser.add_argument(
         "--source",
         type=int,
         default=-4,
-        help="Source block index; -n selects the nth-to-last block (default: -4).",
+        help="Source block index; -n selects the nth-to-last block (default: -1).",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("source", "layerwise"),
+        default="source",
+        help="Recirculate source features or repeat each selected layer in place.",
     )
     # alpha: weight of the source residual stream in the convex combination. 
     parser.add_argument("--alpha", type=float, default=0.5)
@@ -88,7 +95,7 @@ def parse_args() -> argparse.Namespace:
         "--expert-overlap",
         type=float,
         default=0.2,
-        help="Fraction of total experts shared by all temporal shards (default: 0.2).",
+        help="Fraction of total experts shared by each temporal shard pair (default: 0.2).",
     )
     parser.add_argument(
         "--temperature",
@@ -154,19 +161,14 @@ def find_decoder_blocks(model: nn.Module) -> Sequence[nn.Module]:
     )
 
 
-def resolve_shared_expert_count(
+def resolve_pairwise_expert_count(
     num_experts: int, overlap: float, num_shards: int
 ) -> int:
+    if num_shards < 2:
+        return 0
     target = num_experts * overlap
-    candidates = [
-        count
-        for count in range(num_experts)
-        if (num_experts - count) % num_shards == 0
-    ]
-    if not candidates:
-        raise ValueError(
-            f"Cannot split {num_experts} experts into {num_shards} nonempty shards."
-        )
+    num_pairs = num_shards * (num_shards - 1) // 2
+    candidates = range(num_experts // num_pairs + 1)
     return min(candidates, key=lambda count: (abs(count - target), count))
 
 
@@ -187,6 +189,7 @@ class TemporalExpertShards:
         self._subset = 0
         self._expert_subsets: dict[nn.Module, tuple[Tensor, ...]] = {}
         self._handles: list[Any] = []
+        layout_counts: dict[tuple[tuple[int, ...], tuple[int, ...]], int] = {}
         generator = torch.Generator().manual_seed(seed)
 
         for block in blocks:
@@ -202,40 +205,70 @@ class TemporalExpertShards:
                 and isinstance(top_k, int)
             ):
                 continue
-            shared_count = resolve_shared_expert_count(
+            pairwise_count = resolve_pairwise_expert_count(
                 num_experts, overlap, num_shards
             )
-            exclusive_count = num_experts - shared_count
-            exclusive_per_shard = exclusive_count // num_shards
-            shard_size = shared_count + exclusive_per_shard
-            if top_k > shard_size:
+            shard_pairs = tuple(combinations(range(num_shards), 2))
+            pairwise_total = len(shard_pairs) * pairwise_count
+            exclusive_count = num_experts - pairwise_total
+            minimum_shard_size = (
+                exclusive_count // num_shards
+                + (num_shards - 1) * pairwise_count
+            )
+            if top_k > minimum_shard_size:
                 raise ValueError(
                     f"The router selects {top_k} experts, but each temporal shard "
-                    f"contains only {shard_size}."
+                    f"contains at least {minimum_shard_size}."
                 )
 
             permutation = torch.randperm(num_experts, generator=generator)
-            shared = permutation[:shared_count]
-            exclusive = permutation[shared_count:]
+            pairwise_experts = {
+                pair: permutation[
+                    index * pairwise_count : (index + 1) * pairwise_count
+                ]
+                for index, pair in enumerate(shard_pairs)
+            }
+            exclusive_subsets = torch.tensor_split(
+                permutation[pairwise_total:], num_shards
+            )
             subsets = tuple(
                 torch.cat(
-                    (
-                        shared,
-                        exclusive[
-                            subset * exclusive_per_shard :
-                            (subset + 1) * exclusive_per_shard
-                        ],
-                    )
+                    [
+                        exclusive_subsets[subset],
+                        *(
+                            pairwise_experts[pair]
+                            for pair in shard_pairs
+                            if subset in pair
+                        ),
+                    ]
                 )
                 for subset in range(num_shards)
             )
             self._expert_subsets[router] = subsets
             self._handles.append(router.register_forward_hook(self._route_with_subset))
+            layout = (
+                tuple(len(subset) for subset in subsets),
+                tuple(
+                    int(torch.isin(subsets[left], subsets[right]).sum())
+                    for left, right in shard_pairs
+                ),
+            )
+            layout_counts[layout] = layout_counts.get(layout, 0) + 1
 
         print(
             f"Temporal expert sharding into {num_shards} sets with "
             f"{overlap:.0%} overlap for {len(self._handles)} MoE layers."
         )
+        shard_pairs = tuple(combinations(range(num_shards), 2))
+        for (shard_sizes, pairwise_shared), layer_count in layout_counts.items():
+            shared_by_pair = {
+                f"{left}-{right}": count
+                for (left, right), count in zip(shard_pairs, pairwise_shared)
+            }
+            print(
+                f"  {layer_count} layer(s): experts per shard {list(shard_sizes)}; "
+                f"shared by shard pair {shared_by_pair}."
+            )
 
     @property
     def is_moe(self) -> bool:
@@ -292,6 +325,18 @@ def rewind_dynamic_cache(cache: DynamicCache) -> DynamicCache:
     return cache
 
 
+def rewind_dynamic_cache_layer(
+    cache: DynamicCache, layer_index: int
+) -> DynamicCache:
+    layer = cache.layers[layer_index]
+    crop_parameter = next(iter(inspect.signature(layer.crop).parameters.values()))
+    if crop_parameter.name == "tokens_to_remove":
+        layer.crop(-1)
+    else:
+        layer.crop(layer.get_seq_length() - 1)
+    return cache
+
+
 def sample_token(logits: Tensor, temperature: float) -> Tensor:
     if temperature <= 0:
         return logits.argmax(dim=-1, keepdim=True)
@@ -343,15 +388,21 @@ def main() -> None:
         source=resolve_source(args.source, len(blocks)),
         alpha=args.alpha,
         beta=args.beta,
+        mode=args.mode,
     )
     if not 0 <= config.destination < config.source < len(blocks):
         raise ValueError(
             f"The model has {len(blocks)} decoder blocks, but the requested "
             f"indices were destination={config.destination}, source={config.source}."
         )
+    sharded_blocks = (
+        blocks[config.destination : config.source + 1]
+        if config.mode == "layerwise"
+        else blocks[config.destination :]
+    )
     expert_shards = (
         TemporalExpertShards(
-            blocks[config.destination :],
+            sharded_blocks,
             num_shards=args.passes,
             seed=args.seed,
             overlap=args.expert_overlap,
@@ -425,6 +476,7 @@ def main() -> None:
                 config=config,
                 select_expert_subset=expert_shards.select if expert_shards else None,
                 passes=args.passes,
+                rewind_layer=rewind_dynamic_cache_layer,
             )
             next_logits = prompt_logits[:, -1, :]
         else:
@@ -451,6 +503,7 @@ def main() -> None:
                     config=config,
                     select_expert_subset=expert_shards.select if expert_shards else None,
                     passes=args.passes,
+                    rewind_layer=rewind_dynamic_cache_layer,
                 )
             else:
                 token_logits, cache = step(next_token, cache)
