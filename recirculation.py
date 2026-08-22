@@ -68,13 +68,14 @@ class _Hooks:
         if self.h_d is None or self.h_s is None:
             raise RuntimeError("The first pass did not capture both residual streams.")
 
-        destination = self.h_d.float()
-        source = self.h_s.float()
+        input_device = _residual(inputs).device
+        destination = self.h_d.to(device=input_device, dtype=torch.float32)
+        source = self.h_s.to(device=input_device, dtype=torch.float32)
         source *= torch.linalg.vector_norm(destination, dim=-1, keepdim=True) / (
             torch.linalg.vector_norm(source, dim=-1, keepdim=True).clamp_min(self.cfg.eps)
         )
         beta = 1.0 - self.cfg.alpha if self.cfg.beta is None else self.cfg.beta
-        mixed = (beta * destination + self.cfg.alpha * source).to(self.h_d.dtype)
+        mixed = (beta * destination + self.cfg.alpha * source).to(inputs[0].dtype)
         return (mixed, *inputs[1:])
 
     def close(self) -> None:

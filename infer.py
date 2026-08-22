@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -61,11 +62,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Defaults to 1 - alpha.",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=200)
+    parser.add_argument("--max-new-tokens", type=int, default=400)
     parser.add_argument(
         "--tempshard",
         type=int,
-        default=-1,
+        default=2,
         help="Temporarily split MoE experts into this many shards; 2 is supported.",
     )
     parser.add_argument(
@@ -77,8 +78,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--device",
-        default="cuda:1",
-        help="Torch device such as cpu, cuda, or cuda:0. Defaults to auto.",
+        default="auto",
+        help="Single-device fallback used when --device-map is none.",
+    )
+    parser.add_argument(
+        "--device-map",
+        choices=("balanced", "auto", "balanced_low_0", "sequential", "none"),
+        default="balanced",
+        help="Transformers device map. 'balanced' shards layers across all GPUs.",
+    )
+    parser.add_argument(
+        "--gpu-memory",
+        default="46GiB",
+        help="Maximum model memory per GPU when sharding (default: 46GiB).",
     )
     return parser.parse_args()
 
@@ -119,6 +131,7 @@ def find_decoder_blocks(model: nn.Module) -> Sequence[nn.Module]:
 
 class TemporalExpertShards:
     def __init__(self, blocks: Sequence[nn.Module], seed: int) -> None:
+        self._enabled = False
         self._subset = 0
         self._expert_subsets: dict[nn.Module, tuple[Tensor, Tensor]] = {}
         self._handles: list[Any] = []
@@ -161,11 +174,17 @@ class TemporalExpertShards:
     def select(self, subset: int) -> None:
         if subset not in (0, 1):
             raise ValueError("Temporal expert subset must be 0 or 1.")
+        self._enabled = True
         self._subset = subset
+
+    def disable(self) -> None:
+        self._enabled = False
 
     def _route_with_subset(
         self, router: nn.Module, _inputs: tuple[Any, ...], output: Any
     ) -> Any:
+        if not self._enabled:
+            return output
         if not (
             isinstance(output, tuple)
             and len(output) == 3
@@ -222,12 +241,25 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    use_device_map = args.device_map != "none"
+    if use_device_map and not torch.cuda.is_available():
+        raise RuntimeError("--device-map requires CUDA; use --device-map none on CPU/MPS.")
+    dtype = torch.bfloat16 if use_device_map or device.type == "cuda" else torch.float32
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
-    model.to(device)
+    load_kwargs: dict[str, Any] = {"dtype": dtype}
+    if use_device_map:
+        load_kwargs.update(
+            device_map=args.device_map,
+            max_memory={
+                gpu: args.gpu_memory for gpu in range(torch.cuda.device_count())
+            },
+        )
+    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+    if not use_device_map:
+        model.to(device)
     model.eval()
+    input_device = model.get_input_embeddings().weight.device
 
     blocks = find_decoder_blocks(model)
     expert_shards = TemporalExpertShards(blocks, args.seed) if args.tempshard == 2 else None
@@ -271,7 +303,14 @@ def main() -> None:
         return outputs.logits, outputs.past_key_values
 
     prompt = args.prompt or EXAMPLE_QUERIES[args.query_index - 1]
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    encoded_prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=False,
+        return_tensors="pt",
+    )
+    input_ids = encoded_prompt.input_ids.to(input_device)
     if input_ids.shape[1] == 0:
         raise ValueError("The tokenizer produced an empty prompt.")
 
@@ -283,7 +322,10 @@ def main() -> None:
     def generate(use_recirculation: bool) -> Tensor:
         torch.manual_seed(args.seed)
         if expert_shards is not None:
-            expert_shards.select(0)
+            if use_recirculation:
+                expert_shards.select(0)
+            else:
+                expert_shards.disable()
         cache = DynamicCache(config=model.config)
         if use_recirculation:
             cache.activate_past_recording()
@@ -329,15 +371,33 @@ def main() -> None:
 
         return generated_ids
 
-    baseline_ids = generate(use_recirculation=False)
-    recirculated_ids = generate(use_recirculation=True)
+    def synchronize_devices() -> None:
+        if torch.cuda.is_available():
+            for gpu in range(torch.cuda.device_count()):
+                torch.cuda.synchronize(gpu)
+
+    def timed_generate(use_recirculation: bool) -> tuple[Tensor, float]:
+        synchronize_devices()
+        start = time.perf_counter()
+        generated_ids = generate(use_recirculation=use_recirculation)
+        synchronize_devices()
+        return generated_ids, time.perf_counter() - start
+
+    prompt_length = input_ids.shape[1]
+    baseline_ids, baseline_seconds = timed_generate(use_recirculation=False)
+    print(f"=== Recirculation OFF ({baseline_seconds:.3f} s) ===")
+    print(tokenizer.decode(baseline_ids[0, prompt_length:], skip_special_tokens=True))
+
+    recirculated_ids, recirculated_seconds = timed_generate(use_recirculation=True)
     if expert_shards is not None:
         expert_shards.close()
 
-    print("=== Recirculation OFF ===")
-    print(tokenizer.decode(baseline_ids[0], skip_special_tokens=True))
-    print("\n=== Recirculation ON ===")
-    print(tokenizer.decode(recirculated_ids[0], skip_special_tokens=True))
+    print(f"\n=== Recirculation ON ({recirculated_seconds:.3f} s) ===")
+    print(
+        tokenizer.decode(
+            recirculated_ids[0, prompt_length:], skip_special_tokens=True
+        )
+    )
 
 
 if __name__ == "__main__":
