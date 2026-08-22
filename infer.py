@@ -61,7 +61,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Defaults to 1 - alpha.",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=50)
+    parser.add_argument("--max-new-tokens", type=int, default=200)
+    parser.add_argument(
+        "--tempshard",
+        type=int,
+        default=-1,
+        help="Temporarily split MoE experts into this many shards; 2 is supported.",
+    )
     parser.add_argument(
         "--temperature",
         type=float,
@@ -111,6 +117,81 @@ def find_decoder_blocks(model: nn.Module) -> Sequence[nn.Module]:
     )
 
 
+class TemporalExpertShards:
+    def __init__(self, blocks: Sequence[nn.Module], seed: int) -> None:
+        self._subset = 0
+        self._expert_subsets: dict[nn.Module, tuple[Tensor, Tensor]] = {}
+        self._handles: list[Any] = []
+        generator = torch.Generator().manual_seed(seed)
+
+        for block in blocks:
+            mlp = getattr(block, "mlp", None)
+            router = getattr(mlp, "gate", None)
+            experts = getattr(mlp, "experts", None)
+            num_experts = getattr(router, "num_experts", None)
+            top_k = getattr(router, "top_k", None)
+            if not (
+                isinstance(router, nn.Module)
+                and isinstance(experts, nn.Module)
+                and isinstance(num_experts, int)
+                and isinstance(top_k, int)
+            ):
+                continue
+            if num_experts % 2 != 0:
+                raise ValueError(
+                    f"Cannot split a layer's {num_experts} experts evenly into two subsets."
+                )
+            if top_k > num_experts // 2:
+                raise ValueError(
+                    f"The router selects {top_k} experts, but each temporal shard "
+                    f"contains only {num_experts // 2}."
+                )
+
+            permutation = torch.randperm(num_experts, generator=generator)
+            subsets = permutation[: num_experts // 2], permutation[num_experts // 2 :]
+            self._expert_subsets[router] = subsets
+            self._handles.append(router.register_forward_hook(self._route_with_subset))
+
+        print(f"Temporal expert sharding experts into 2 subsets for {len(self._handles)} MoE layers. ")
+
+    @property
+    def is_moe(self) -> bool:
+        return bool(self._handles)
+
+    def select(self, subset: int) -> None:
+        if subset not in (0, 1):
+            raise ValueError("Temporal expert subset must be 0 or 1.")
+        self._subset = subset
+
+    def _route_with_subset(
+        self, router: nn.Module, _inputs: tuple[Any, ...], output: Any
+    ) -> Any:
+        if not (
+            isinstance(output, tuple)
+            and len(output) == 3
+            and all(isinstance(value, Tensor) for value in output)
+        ):
+            raise TypeError(
+                f"Unsupported MoE router output from {type(router).__name__}; "
+                "expected (logits, scores, expert_indices)."
+            )
+
+        router_logits, router_scores, _selected_experts = output
+        allowed = self._expert_subsets[router][self._subset].to(router_logits.device)
+        allowed_logits = router_logits.index_select(-1, allowed)
+        probabilities = torch.softmax(allowed_logits, dtype=torch.float, dim=-1)
+        scores, local_indices = torch.topk(
+            probabilities, router_scores.shape[-1], dim=-1
+        )
+        scores /= scores.sum(dim=-1, keepdim=True)
+        selected_experts = allowed[local_indices]
+        return router_logits, scores.to(router_logits.dtype), selected_experts
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+
+
 def rewind_dynamic_cache(cache: DynamicCache) -> DynamicCache:
     crop_parameter = next(iter(inspect.signature(cache.crop).parameters.values()))
     if crop_parameter.name == "tokens_to_remove":
@@ -149,6 +230,10 @@ def main() -> None:
     model.eval()
 
     blocks = find_decoder_blocks(model)
+    expert_shards = TemporalExpertShards(blocks, args.seed) if args.tempshard == 2 else None
+    if expert_shards is not None and not expert_shards.is_moe:
+        expert_shards.close()
+        expert_shards = None
     config = RecirculationConfig(
         destination=args.destination,
         source=args.source,
@@ -197,6 +282,8 @@ def main() -> None:
 
     def generate(use_recirculation: bool) -> Tensor:
         torch.manual_seed(args.seed)
+        if expert_shards is not None:
+            expert_shards.select(0)
         cache = DynamicCache(config=model.config)
         if use_recirculation:
             cache.activate_past_recording()
@@ -209,6 +296,7 @@ def main() -> None:
                 step=step,
                 rewind_one=rewind_dynamic_cache,
                 config=config,
+                select_expert_subset=expert_shards.select if expert_shards else None,
             )
             next_logits = prompt_logits[:, -1, :]
         else:
@@ -233,6 +321,7 @@ def main() -> None:
                     step=step,
                     rewind_one=rewind_dynamic_cache,
                     config=config,
+                    select_expert_subset=expert_shards.select if expert_shards else None,
                 )
             else:
                 token_logits, cache = step(next_token, cache)
@@ -242,6 +331,8 @@ def main() -> None:
 
     baseline_ids = generate(use_recirculation=False)
     recirculated_ids = generate(use_recirculation=True)
+    if expert_shards is not None:
+        expert_shards.close()
 
     print("=== Recirculation OFF ===")
     print(tokenizer.decode(baseline_ids[0], skip_special_tokens=True))

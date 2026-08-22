@@ -1,4 +1,6 @@
 """Minimal reference for one-step, training-free recirculation.
+   Originally implemented by Benhao Huang:
+   https://gist.github.com/huskydoge/1ff29693e2172226ec26081f208b19d6
 
 For every token:
   1. Run a normal cached pass; return its logits and save residuals h_d, h_s.
@@ -89,6 +91,7 @@ def recirculate(
     step: Callable[[Tensor, Any], tuple[Tensor, Any]],
     rewind_one: Callable[[Any], Any],
     config: RecirculationConfig,
+    select_expert_subset: Callable[[int], None] | None = None,
 ) -> tuple[Tensor, Any]:
     """Return first-pass logits and the second-pass cache."""
 
@@ -98,6 +101,8 @@ def recirculate(
         for position in range(input_ids.shape[1]):
             token = input_ids[:, position : position + 1]
 
+            if select_expert_subset is not None:
+                select_expert_subset(0)
             hooks.h_d = hooks.h_s = None
             hooks.mode = "capture"
             first_logits, cache = step(token, cache)
@@ -105,10 +110,14 @@ def recirculate(
             logits.append(first_logits)
 
             cache = rewind_one(cache)
+            if select_expert_subset is not None:
+                select_expert_subset(1)
             hooks.mode = "inject"
             _ignored_logits, cache = step(token, cache)
             hooks.mode = "off"
     finally:
+        if select_expert_subset is not None:
+            select_expert_subset(0)
         hooks.close()
 
     return torch.cat(logits, dim=1), cache
