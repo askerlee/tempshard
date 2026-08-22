@@ -29,7 +29,7 @@ EXAMPLE_QUERIES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate text with one-step residual-stream recirculation."
+        description="Generate text with multi-pass residual-stream recirculation."
     )
     parser.add_argument(
         "prompt",
@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Defaults to 1 - alpha.",
     )
+    parser.add_argument(
+        "--passes",
+        type=int,
+        default=2,
+        help="Total model passes per token, including the initial pass (default: 2).",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=300)
     parser.add_argument(
         "--skip-baseline",
@@ -75,15 +81,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--tempshard",
-        type=int,
-        default=2,
-        help="Temporarily split MoE experts into this many shards; 2 is supported.",
+        action="store_true",
+        help="Split MoE experts into one temporal shard per pass.",
     )
     parser.add_argument(
         "--expert-overlap",
         type=float,
         default=0.2,
-        help="Fraction of experts shared by both temporal shards (default: 0.2).",
+        help="Fraction of total experts shared by all temporal shards (default: 0.2).",
     )
     parser.add_argument(
         "--temperature",
@@ -149,23 +154,38 @@ def find_decoder_blocks(model: nn.Module) -> Sequence[nn.Module]:
     )
 
 
-def resolve_shared_expert_count(num_experts: int, overlap: float) -> int:
+def resolve_shared_expert_count(
+    num_experts: int, overlap: float, num_shards: int
+) -> int:
     target = num_experts * overlap
-    shared_count = round(target)
-    if (num_experts - shared_count) % 2 != 0:
-        shared_count += 1 if target > shared_count else -1
-    return shared_count
+    candidates = [
+        count
+        for count in range(num_experts)
+        if (num_experts - count) % num_shards == 0
+    ]
+    if not candidates:
+        raise ValueError(
+            f"Cannot split {num_experts} experts into {num_shards} nonempty shards."
+        )
+    return min(candidates, key=lambda count: (abs(count - target), count))
 
 
 class TemporalExpertShards:
     def __init__(
-        self, blocks: Sequence[nn.Module], seed: int, overlap: float = 0.25
+        self,
+        blocks: Sequence[nn.Module],
+        num_shards: int,
+        seed: int,
+        overlap: float = 0.2,
     ) -> None:
+        if num_shards < 1:
+            raise ValueError("The number of temporal shards must be at least 1.")
         if not 0.0 <= overlap < 1.0:
             raise ValueError("Expert overlap must be in the range [0, 1).")
+        self._num_shards = num_shards
         self._enabled = False
         self._subset = 0
-        self._expert_subsets: dict[nn.Module, tuple[Tensor, Tensor]] = {}
+        self._expert_subsets: dict[nn.Module, tuple[Tensor, ...]] = {}
         self._handles: list[Any] = []
         generator = torch.Generator().manual_seed(seed)
 
@@ -182,9 +202,12 @@ class TemporalExpertShards:
                 and isinstance(top_k, int)
             ):
                 continue
-            shared_count = resolve_shared_expert_count(num_experts, overlap)
+            shared_count = resolve_shared_expert_count(
+                num_experts, overlap, num_shards
+            )
             exclusive_count = num_experts - shared_count
-            shard_size = shared_count + exclusive_count // 2
+            exclusive_per_shard = exclusive_count // num_shards
+            shard_size = shared_count + exclusive_per_shard
             if top_k > shard_size:
                 raise ValueError(
                     f"The router selects {top_k} experts, but each temporal shard "
@@ -194,17 +217,24 @@ class TemporalExpertShards:
             permutation = torch.randperm(num_experts, generator=generator)
             shared = permutation[:shared_count]
             exclusive = permutation[shared_count:]
-            split = exclusive_count // 2
-            subsets = (
-                torch.cat((shared, exclusive[:split])),
-                torch.cat((shared, exclusive[split:])),
+            subsets = tuple(
+                torch.cat(
+                    (
+                        shared,
+                        exclusive[
+                            subset * exclusive_per_shard :
+                            (subset + 1) * exclusive_per_shard
+                        ],
+                    )
+                )
+                for subset in range(num_shards)
             )
             self._expert_subsets[router] = subsets
             self._handles.append(router.register_forward_hook(self._route_with_subset))
 
         print(
-            f"Temporal expert sharding with {overlap:.0%} overlap for "
-            f"{len(self._handles)} MoE layers."
+            f"Temporal expert sharding into {num_shards} sets with "
+            f"{overlap:.0%} overlap for {len(self._handles)} MoE layers."
         )
 
     @property
@@ -212,8 +242,10 @@ class TemporalExpertShards:
         return bool(self._handles)
 
     def select(self, subset: int) -> None:
-        if subset not in (0, 1):
-            raise ValueError("Temporal expert subset must be 0 or 1.")
+        if not 0 <= subset < self._num_shards:
+            raise ValueError(
+                f"Temporal expert subset must be in [0, {self._num_shards})."
+            )
         self._enabled = True
         self._subset = subset
 
@@ -276,6 +308,8 @@ def main() -> None:
 
     if args.max_new_tokens < 0:
         raise ValueError("--max-new-tokens must be nonnegative.")
+    if args.passes < 1:
+        raise ValueError("--passes must be at least 1.")
     if args.temperature < 0:
         raise ValueError("--temperature must be nonnegative.")
     if not 0.0 <= args.expert_overlap < 1.0:
@@ -317,9 +351,12 @@ def main() -> None:
         )
     expert_shards = (
         TemporalExpertShards(
-            blocks[config.destination :], args.seed, args.expert_overlap
+            blocks[config.destination :],
+            num_shards=args.passes,
+            seed=args.seed,
+            overlap=args.expert_overlap,
         )
-        if args.tempshard == 2
+        if args.tempshard
         else None
     )
     if expert_shards is not None and not expert_shards.is_moe:
@@ -387,6 +424,7 @@ def main() -> None:
                 rewind_one=rewind_dynamic_cache,
                 config=config,
                 select_expert_subset=expert_shards.select if expert_shards else None,
+                passes=args.passes,
             )
             next_logits = prompt_logits[:, -1, :]
         else:
@@ -412,6 +450,7 @@ def main() -> None:
                     rewind_one=rewind_dynamic_cache,
                     config=config,
                     select_expert_subset=expert_shards.select if expert_shards else None,
+                    passes=args.passes,
                 )
             else:
                 token_logits, cache = step(next_token, cache)

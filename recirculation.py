@@ -1,13 +1,14 @@
-"""Minimal reference for one-step, training-free recirculation.
+"""Minimal reference for multi-pass, training-free recirculation.
    Originally implemented by Benhao Huang:
    https://gist.github.com/huskydoge/1ff29693e2172226ec26081f208b19d6
 
-For every token:
+For every token (with three passes):
   1. Run a normal cached pass; return its logits and save residuals h_d, h_s.
   2. Rewind the KV cache by one position.
   3. Run the token again, replacing the output of destination block d with
      beta * h_d + alpha * (||h_d|| / ||h_s||) * h_s.
-  4. Ignore the second logits and commit the second-pass KV cache.
+    4. Capture the new residuals, rewind, and repeat the recirculation once more.
+    5. Ignore the recirculated logits and commit the final-pass KV cache.
 
 ``step(token, cache)`` and ``rewind_one(cache)`` are model-specific adapters.
 Block indices are zero-based outputs, so the mixture is injected as the input
@@ -55,11 +56,11 @@ class _Hooks:
         )
 
     def _save_destination(self, _module: nn.Module, _inputs: tuple, output: Any) -> None:
-        if self.mode == "capture":
+        if self.mode in ("capture", "inject"):
             self.h_d = _residual(output).detach().clone()
 
     def _save_source(self, _module: nn.Module, _inputs: tuple, output: Any) -> None:
-        if self.mode == "capture":
+        if self.mode in ("capture", "inject"):
             self.h_s = _residual(output).detach().clone()
 
     def _inject(self, _module: nn.Module, inputs: tuple) -> tuple | None:
@@ -93,8 +94,12 @@ def recirculate(
     rewind_one: Callable[[Any], Any],
     config: RecirculationConfig,
     select_expert_subset: Callable[[int], None] | None = None,
+    passes: int = 3,
 ) -> tuple[Tensor, Any]:
-    """Return first-pass logits and the second-pass cache."""
+    """Return first-pass logits and the final-pass cache."""
+
+    if passes < 1:
+        raise ValueError("passes must be at least 1.")
 
     logits = []
     hooks = _Hooks(blocks, config)
@@ -110,12 +115,13 @@ def recirculate(
             hooks.mode = "off"
             logits.append(first_logits)
 
-            cache = rewind_one(cache)
-            if select_expert_subset is not None:
-                select_expert_subset(1)
-            hooks.mode = "inject"
-            _ignored_logits, cache = step(token, cache)
-            hooks.mode = "off"
+            for pass_index in range(1, passes):
+                cache = rewind_one(cache)
+                if select_expert_subset is not None:
+                    select_expert_subset(pass_index)
+                hooks.mode = "inject"
+                _ignored_logits, cache = step(token, cache)
+                hooks.mode = "off"
     finally:
         if select_expert_subset is not None:
             select_expert_subset(0)
