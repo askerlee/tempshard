@@ -8,7 +8,7 @@ In source-to-destination mode, for every token (with three passes):
   3. Run the token again, replacing the output of destination block d with
      beta * h_d + alpha * (||h_d|| / ||h_s||) * h_s.
     4. Capture the new residuals, rewind, and repeat the recirculation once more.
-    5. Ignore the recirculated logits and commit the final-pass KV cache.
+    5. Return the final-pass logits and commit its KV cache.
 
 In layerwise mode, each block from destination through source is run ``passes``
 times in place, feeding each pass output into the next pass after matching the
@@ -232,15 +232,16 @@ def recirculate(
             hooks.mode = "capture"
             first_logits, cache = step(token, cache)
             hooks.mode = "off"
-            logits.append(first_logits)
+            final_logits = first_logits
 
             for pass_index in range(1, passes):
                 cache = rewind_one(cache)
                 if select_expert_subset is not None:
                     select_expert_subset(pass_index)
                 hooks.mode = "inject"
-                _ignored_logits, cache = step(token, cache)
+                final_logits, cache = step(token, cache)
                 hooks.mode = "off"
+            logits.append(final_logits)
     finally:
         if select_expert_subset is not None:
             select_expert_subset(0)

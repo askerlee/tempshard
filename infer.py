@@ -95,7 +95,7 @@ def parse_args() -> argparse.Namespace:
         "--expert-overlap",
         type=float,
         default=0.2,
-        help="Fraction of total experts shared by each temporal shard pair (default: 0.2).",
+        help="Fraction of total experts assigned to each pair's common group (default: 0.2).",
     )
     parser.add_argument(
         "--temperature",
@@ -166,10 +166,7 @@ def resolve_pairwise_expert_count(
 ) -> int:
     if num_shards < 2:
         return 0
-    target = num_experts * overlap
-    num_pairs = num_shards * (num_shards - 1) // 2
-    candidates = range(num_experts // num_pairs + 1)
-    return min(candidates, key=lambda count: (abs(count - target), count))
+    return min(round(num_experts * overlap), num_experts)
 
 
 class TemporalExpertShards:
@@ -189,7 +186,10 @@ class TemporalExpertShards:
         self._subset = 0
         self._expert_subsets: dict[nn.Module, tuple[Tensor, ...]] = {}
         self._handles: list[Any] = []
-        layout_counts: dict[tuple[tuple[int, ...], tuple[int, ...]], int] = {}
+        layout_counts: dict[
+            tuple[int, int, tuple[int, ...], tuple[int, ...]], int
+        ] = {}
+        partitions: dict[int, tuple[Tensor, ...]] = {}
         generator = torch.Generator().manual_seed(seed)
 
         for block in blocks:
@@ -209,44 +209,49 @@ class TemporalExpertShards:
                 num_experts, overlap, num_shards
             )
             shard_pairs = tuple(combinations(range(num_shards), 2))
-            pairwise_total = len(shard_pairs) * pairwise_count
-            exclusive_count = num_experts - pairwise_total
-            minimum_shard_size = (
-                exclusive_count // num_shards
-                + (num_shards - 1) * pairwise_count
-            )
+            subsets = partitions.get(num_experts)
+            if subsets is None:
+                pairwise_experts = {
+                    pair: torch.randperm(num_experts, generator=generator)[
+                        :pairwise_count
+                    ]
+                    for pair in shard_pairs
+                }
+                shared_mask = torch.zeros(num_experts, dtype=torch.bool)
+                for shared in pairwise_experts.values():
+                    shared_mask[shared] = True
+                exclusive = torch.arange(num_experts)[~shared_mask]
+                exclusive_subsets = torch.tensor_split(
+                    exclusive[torch.randperm(len(exclusive), generator=generator)],
+                    num_shards,
+                )
+                subsets = tuple(
+                    torch.unique(
+                        torch.cat(
+                            [
+                                exclusive_subsets[subset],
+                                *(
+                                    pairwise_experts[pair]
+                                    for pair in shard_pairs
+                                    if subset in pair
+                                ),
+                            ]
+                        )
+                    )
+                    for subset in range(num_shards)
+                )
+                partitions[num_experts] = subsets
+            minimum_shard_size = min(len(subset) for subset in subsets)
             if top_k > minimum_shard_size:
                 raise ValueError(
-                    f"The router selects {top_k} experts, but each temporal shard "
-                    f"contains at least {minimum_shard_size}."
+                    f"The router selects {top_k} experts, but the smallest temporal "
+                    f"shard contains only {minimum_shard_size}."
                 )
-
-            permutation = torch.randperm(num_experts, generator=generator)
-            pairwise_experts = {
-                pair: permutation[
-                    index * pairwise_count : (index + 1) * pairwise_count
-                ]
-                for index, pair in enumerate(shard_pairs)
-            }
-            exclusive_subsets = torch.tensor_split(
-                permutation[pairwise_total:], num_shards
-            )
-            subsets = tuple(
-                torch.cat(
-                    [
-                        exclusive_subsets[subset],
-                        *(
-                            pairwise_experts[pair]
-                            for pair in shard_pairs
-                            if subset in pair
-                        ),
-                    ]
-                )
-                for subset in range(num_shards)
-            )
             self._expert_subsets[router] = subsets
             self._handles.append(router.register_forward_hook(self._route_with_subset))
             layout = (
+                num_experts,
+                pairwise_count,
                 tuple(len(subset) for subset in subsets),
                 tuple(
                     int(torch.isin(subsets[left], subsets[right]).sum())
@@ -260,14 +265,21 @@ class TemporalExpertShards:
             f"{overlap:.0%} overlap for {len(self._handles)} MoE layers."
         )
         shard_pairs = tuple(combinations(range(num_shards), 2))
-        for (shard_sizes, pairwise_shared), layer_count in layout_counts.items():
+        for (
+            total_experts,
+            common_group_size,
+            shard_sizes,
+            pairwise_shared,
+        ), layer_count in layout_counts.items():
             shared_by_pair = {
                 f"{left}-{right}": count
                 for (left, right), count in zip(shard_pairs, pairwise_shared)
             }
             print(
-                f"  {layer_count} layer(s): experts per shard {list(shard_sizes)}; "
-                f"shared by shard pair {shared_by_pair}."
+                f"  {layer_count} layer(s): {total_experts} total experts; "
+                f"{common_group_size} assigned to each pair group; "
+                f"experts per shard {list(shard_sizes)}; "
+                f"actual intersections {shared_by_pair}."
             )
 
     @property
