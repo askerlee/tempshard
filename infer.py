@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import json
+import os
+import re
 import sys
 import time
-from collections.abc import Sequence
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Sequence
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -38,6 +43,140 @@ EXAMPLE_QUERIES = (
     "A news platform wants to reduce misinformation without suppressing legitimate disagreement or breaking-news updates that later change. Design a moderation approach that combines labels, distribution rules, appeals, and evidence standards, then explain its likely failure modes.",
     "A manufacturer can lower emissions by replacing equipment now, purchasing cleaner electricity, or waiting for a promising technology still under development. Recommend a staged strategy using plausible assumptions about cost, risk, and regulation, and specify signals that would trigger a change in course.",
 )
+
+
+def parse_results(path: Path) -> list[tuple[str, list[tuple[str, str]]]]:
+    text = path.read_text(encoding="utf-8")
+    sections = re.split(r"\n=== Query ===\n", text)[1:]
+    parsed: list[tuple[str, list[tuple[str, str]]]] = []
+    header = re.compile(r"\n=== (Baseline|Ablation): ([^\n]+) \([^\n]+\) ===\n")
+    for section in sections:
+        query, *run_parts = header.split(section)
+        runs = [
+            (f"{run_parts[index]}: {run_parts[index + 1]}", run_parts[index + 2].strip())
+            for index in range(0, len(run_parts), 3)
+        ]
+        if not runs:
+            raise ValueError("A query has no parseable method results.")
+        parsed.append((query.strip(), runs))
+    if not parsed:
+        raise ValueError(f"No query sections found in {path}.")
+    return parsed
+
+
+def build_evaluation_prompt(
+    query: str, answers: Sequence[tuple[str, str]]
+) -> str:
+    formatted_answers = "\n\n".join(
+        f"METHOD {index}: {label}\n{answer}"
+        for index, (label, answer) in enumerate(answers, start=1)
+    )
+    return f"""Evaluate the following excerpts from answers to the query.
+These excerpts may end abruptly because the source answer was truncated. Treat
+each excerpt as the complete evidence available for grading, not as an incomplete
+submission. Never deduct points because a later section, recommendation, caveat,
+or requested item is absent after the visible ending. Do not infer that the answer
+would have addressed anything beyond the excerpt. Score only the quality of what
+is visible: factual correctness, clarity, internal reasoning, and usefulness of
+the visible material. Assess coverage only of the claims or subtopics actually
+present in the excerpt. Do not reward length or formatting.
+Return JSON only, as an array in the same order, with objects containing exactly
+the integer field method, the floating-point field score, and a brief string field
+rationale. Scores may use one decimal place, such as 8.5.
+
+QUERY:
+{query}
+
+ANSWERS:
+{formatted_answers}
+"""
+
+
+def parse_evaluation(text: str, method_count: int) -> list[dict[str, Any]]:
+    match = re.search(r"\[.*\]", text, flags=re.DOTALL)
+    if match is None:
+        raise ValueError(f"Evaluator did not return a JSON array: {text!r}")
+    evaluations = json.loads(match.group(0))
+    if not isinstance(evaluations, list) or len(evaluations) != method_count:
+        raise ValueError("Evaluator returned the wrong number of scores.")
+    for expected_method, evaluation in enumerate(evaluations, start=1):
+        if evaluation.get("method") != expected_method:
+            raise ValueError("Evaluator returned methods out of order.")
+        score = evaluation.get("score")
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not 0 <= score <= 10
+        ):
+            raise ValueError("Evaluator scores must be numbers from 0 to 10.")
+        evaluation["score"] = float(score)
+    return evaluations
+
+
+def openai_evaluate(prompt: str, model: str, api_key: str, base_url: str) -> str:
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/chat/completions",
+        data=json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+        ).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API request failed ({error.code}): {detail}") from error
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise RuntimeError("OpenAI API response did not contain message content.") from error
+    print(f"OpenAI evaluator response:\n{content}\n", flush=True)
+    return content
+
+
+def write_evaluation_report(
+    results: list[tuple[str, list[tuple[str, str]]]],
+    output_path: Path,
+    evaluator: Callable[[str, int], str],
+) -> None:
+    score_totals: dict[str, list[float]] = {}
+    report_lines = [
+        "# Partial-answer ratings",
+        "",
+        "Scores use a 0-10 scale and reflect only the visible answer text.",
+        "",
+    ]
+    table_headers = ["Query"] + [label for label, _ in results[0][1]]
+    report_lines.append("| " + " | ".join(table_headers) + " |")
+    report_lines.append("| " + " | ".join("---" for _ in table_headers) + " |")
+
+    for query_index, (query, answers) in enumerate(results, start=1):
+        print(f"Evaluating query {query_index}/{len(results)}...", flush=True)
+        evaluations = parse_evaluation(
+            evaluator(build_evaluation_prompt(query, answers), len(answers)),
+            len(answers),
+        )
+        scores = []
+        for (label, _), evaluation in zip(answers, evaluations):
+            score = evaluation["score"]
+            score_totals.setdefault(label, []).append(score)
+            scores.append(f"{score:.2f}")
+        report_lines.append("| " + " | ".join([str(query_index), *scores]) + " |")
+
+    report_lines.extend(("", "## Method averages", ""))
+    report_lines.append("| Method | Average rating |")
+    report_lines.append("| --- | ---: |")
+    for label, scores in score_totals.items():
+        report_lines.append(f"| {label} | {sum(scores) / len(scores):.2f} |")
+    output_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
 
 def parse_query_indices(value: str) -> tuple[int, ...]:
@@ -89,7 +228,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Print the built-in queries and exit.",
     )
+    parser.add_argument(
+        "--provider",
+        choices=("local", "openai"),
+        default="openai",
+        help="Use a local Transformers model or the OpenAI API for evaluation.",
+    )
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B-FP8")
+    parser.add_argument(
+        "--evaluation-model",
+        default="gpt-5.6-terra",
+        help="Model used by the OpenAI evaluator (default: gpt-5.6-luna).",
+    )
+    parser.add_argument(
+        "--openai-base-url",
+        default="https://api.openai.com/v1",
+        help="OpenAI API base URL, also usable with compatible APIs.",
+    )
     parser.add_argument("--destination", type=int, default=4)
     parser.add_argument(
         "--source",
@@ -195,7 +350,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
+        default="results.txt",
         help="Save the query and generated output report to this file.",
+    )
+    parser.add_argument(
+        "--evaluate-results",
+        type=Path,
+        metavar="PATH",
+        help="Evaluate partial answers in an existing results report and exit.",
+    )
+    parser.add_argument(
+        "--evaluation-output",
+        type=Path,
+        default=Path("ratings.md"),
+        help="Save the evaluation table to this Markdown file.",
     )
     if "--ablations" not in argv:
         args = parser.parse_args(argv)
@@ -559,6 +727,22 @@ def main() -> None:
     if not 0.0 <= args.expert_overlap < 1.0:
         raise ValueError("--expert-overlap must be in the range [0, 1).")
 
+    if args.provider == "openai":
+        if args.evaluate_results is None:
+            raise ValueError("--provider openai requires --evaluate-results.")
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("Set OPENAI_API_KEY before using --provider openai.")
+        write_evaluation_report(
+            parse_results(args.evaluate_results),
+            args.evaluation_output,
+            lambda prompt, _method_count: openai_evaluate(
+                prompt, args.evaluation_model, api_key, args.openai_base_url
+            ),
+        )
+        print(args.evaluation_output.read_text(encoding="utf-8"), end="")
+        return
+
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
     use_device_map = args.device_map != "none"
@@ -580,6 +764,57 @@ def main() -> None:
         model.to(device)
     model.eval()
     input_device = model.get_input_embeddings().weight.device
+
+    if args.evaluate_results is not None:
+        results = parse_results(args.evaluate_results)
+        score_totals: dict[str, list[int]] = {}
+        report_lines = [
+            "# Partial-answer ratings",
+            "",
+            "Scores use a 0-10 scale and reflect only the visible answer text.",
+            "",
+        ]
+        table_headers = ["Query"] + [label for label, _ in results[0][1]]
+        report_lines.append("| " + " | ".join(table_headers) + " |")
+        report_lines.append("| " + " | ".join("---" for _ in table_headers) + " |")
+
+        for query_index, (query, answers) in enumerate(results, start=1):
+            evaluation_input = tokenizer.apply_chat_template(
+                [{"role": "user", "content": build_evaluation_prompt(query, answers)}],
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=False,
+                return_tensors="pt",
+            ).to(input_device)
+            with torch.inference_mode():
+                evaluation_ids = model.generate(
+                    input_ids=evaluation_input,
+                    max_new_tokens=500,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            evaluation_text = tokenizer.decode(
+                evaluation_ids[0, evaluation_input.shape[1] :],
+                skip_special_tokens=True,
+            )
+            evaluations = parse_evaluation(evaluation_text, len(answers))
+            scores = []
+            for (label, _), evaluation in zip(answers, evaluations):
+                score = evaluation["score"]
+                score_totals.setdefault(label, []).append(score)
+                scores.append(str(score))
+            report_lines.append(
+                "| " + " | ".join([str(query_index), *scores]) + " |"
+            )
+
+        report_lines.extend(("", "## Method averages", ""))
+        report_lines.append("| Method | Average rating |")
+        report_lines.append("| --- | ---: |")
+        for label, scores in score_totals.items():
+            report_lines.append(f"| {label} | {sum(scores) / len(scores):.2f} |")
+        args.evaluation_output.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+        print(args.evaluation_output.read_text(encoding="utf-8"), end="")
+        return
 
     def expected_embedding(logits: Tensor, requested_top_k: int) -> Tensor:
         embedding = model.get_input_embeddings()
