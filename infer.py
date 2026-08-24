@@ -6,6 +6,7 @@ import sys
 import time
 from collections.abc import Sequence
 from itertools import combinations
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -39,6 +40,29 @@ EXAMPLE_QUERIES = (
 )
 
 
+def parse_query_indices(value: str) -> tuple[int, ...]:
+    indices: list[int] = []
+    for part in value.split(","):
+        bounds = part.split("-", maxsplit=1)
+        try:
+            start = int(bounds[0])
+            end = int(bounds[-1])
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                f"invalid query index or range: {part!r}"
+            ) from error
+        if start > end:
+            raise argparse.ArgumentTypeError(
+                f"query index range must be ascending: {part!r}"
+            )
+        if start < 1 or end > len(EXAMPLE_QUERIES):
+            raise argparse.ArgumentTypeError(
+                f"query indices must be between 1 and {len(EXAMPLE_QUERIES)}"
+            )
+        indices.extend(range(start, end + 1))
+    return tuple(dict.fromkeys(indices))
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
@@ -51,11 +75,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--query-index",
-        type=int,
-        choices=range(1, len(EXAMPLE_QUERIES) + 1),
-        default=1,
-        metavar="N",
-        help="Select a built-in query by its 1-based index (default: 1).",
+        dest="query_indices",
+        type=parse_query_indices,
+        default=tuple(range(1, len(EXAMPLE_QUERIES) + 1)),
+        metavar="INDEX[-INDEX][,...]",
+        help=(
+            "Select built-in queries by 1-based index or inclusive range "
+            "(default: all queries)."
+        ),
     )
     parser.add_argument(
         "--list-queries",
@@ -164,6 +191,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--gpu-memory",
         default="46GiB",
         help="Maximum model memory per GPU when sharding (default: 46GiB).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Save the query and generated output report to this file.",
     )
     if "--ablations" not in argv:
         args = parser.parse_args(argv)
@@ -587,18 +619,6 @@ def main() -> None:
         )
         return outputs.logits, outputs.past_key_values
 
-    prompt = args.prompt or EXAMPLE_QUERIES[args.query_index - 1]
-    encoded_prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
-        tokenize=True,
-        add_generation_prompt=True,
-        enable_thinking=False,
-        return_tensors="pt",
-    )
-    input_ids = encoded_prompt.input_ids.to(input_device)
-    if input_ids.shape[1] == 0:
-        raise ValueError("The tokenizer produced an empty prompt.")
-
     eos_token_ids = model.generation_config.eos_token_id
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
@@ -740,7 +760,6 @@ def main() -> None:
             if expert_shards is not None:
                 expert_shards.close()
 
-    prompt_length = input_ids.shape[1]
     if args.ablations is False or args.ablations is None:
         runs = [(args, True, "Recirculation ON")]
     else:
@@ -761,19 +780,48 @@ def main() -> None:
             arguments = format_run_arguments(ablation_args, label_options)
             runs.append((ablation_args, True, f"Ablation: {arguments}"))
 
-    for run_index, (run_args, use_recirculation, label) in enumerate(runs):
-        run_ids, run_seconds = timed_generate(
-            use_recirculation=use_recirculation, run_args=run_args
-        )
-        if run_index == 0:
-            print("\n=== Query ===")
-            print(prompt)
-        print(f"\n=== {label} ({run_seconds:.3f} s) ===")
-        print(
-            tokenizer.decode(
-                run_ids[0, prompt_length:], skip_special_tokens=True
+    prompts = (
+        (args.prompt,)
+        if args.prompt is not None
+        else tuple(EXAMPLE_QUERIES[index - 1] for index in args.query_indices)
+    )
+    output_file = args.output.open("w", encoding="utf-8") if args.output else None
+
+    def emit(text: str) -> None:
+        print(text)
+        if output_file is not None:
+            print(text, file=output_file, flush=True)
+
+    try:
+        for prompt in prompts:
+            encoded_prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=False,
+                return_tensors="pt",
             )
-        )
+            input_ids = encoded_prompt.input_ids.to(input_device)
+            if input_ids.shape[1] == 0:
+                raise ValueError("The tokenizer produced an empty prompt.")
+            prompt_length = input_ids.shape[1]
+
+            for run_index, (run_args, use_recirculation, label) in enumerate(runs):
+                run_ids, run_seconds = timed_generate(
+                    use_recirculation=use_recirculation, run_args=run_args
+                )
+                if run_index == 0:
+                    emit("\n=== Query ===")
+                    emit(prompt)
+                emit(f"\n=== {label} ({run_seconds:.3f} s) ===")
+                emit(
+                    tokenizer.decode(
+                        run_ids[0, prompt_length:], skip_special_tokens=True
+                    )
+                )
+    finally:
+        if output_file is not None:
+            output_file.close()
 
 
 if __name__ == "__main__":
