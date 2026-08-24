@@ -12,6 +12,8 @@ In source-to-destination mode, for every token (with three passes):
 
 When expected-embedding subtraction is enabled, each replay subtracts the
 top-K expected next-token embedding from h_s before norm matching and mixing.
+With orthogonal mixing, each replay removes source projections onto every
+destination activation captured by earlier passes for the current token.
 
 In layerwise mode, each block from destination through source is run ``passes``
 times in place, feeding each pass output into the next pass after matching the
@@ -27,7 +29,7 @@ This is the serial reference, not the paper's serving pipeline.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
@@ -50,10 +52,21 @@ class RecirculationConfig:
 class MagnitudeDiffStats:
     fraction_sum: float = 0.0
     count: int = 0
+    projection_sums: list[float] = field(default_factory=list)
+    projection_counts: list[int] = field(default_factory=list)
 
     @property
     def mean(self) -> float | None:
         return self.fraction_sum / self.count if self.count else None
+
+    @property
+    def projection_means(self) -> list[float]:
+        return [
+            projection_sum / projection_count
+            for projection_sum, projection_count in zip(
+                self.projection_sums, self.projection_counts
+            )
+        ]
 
 
 def _residual(output: Any) -> Tensor:
@@ -75,6 +88,7 @@ class _Hooks:
         self.cfg = cfg
         self.mode = "off"
         self.h_d: Tensor | None = None
+        self.h_d_history: list[Tensor] = []
         self.h_s: Tensor | None = None
         self.expected_embedding: Tensor | None = None
         self.recirculation_index = 0
@@ -88,6 +102,7 @@ class _Hooks:
     def _save_destination(self, _module: nn.Module, _inputs: tuple, output: Any) -> None:
         if self.mode in ("capture", "inject"):
             self.h_d = _residual(output).detach().clone()
+            self.h_d_history.append(self.h_d)
 
     def _save_source(self, _module: nn.Module, _inputs: tuple, output: Any) -> None:
         if self.mode in ("capture", "inject"):
@@ -120,23 +135,33 @@ class _Hooks:
 
         beta = 1.0 - self.cfg.alpha if self.cfg.beta is None else self.cfg.beta
         if self.cfg.ortho_mix:
-            projection = (source * destination).sum(dim=-1, keepdim=True) / (
-                destination.square().sum(dim=-1, keepdim=True).clamp_min(
-                    self.cfg.eps
-                )
-            )
-            # print(f"projection.max() = {projection.max().item():.3f}")
-            # projection = projection.clamp_max(0.5)
-            # The overall removed relative magnitude is 0.5*0.5 = 0.25.
-            # breakpoint()
             coeff_index = (
                 0 if len(self.cfg.ortho_mix_coeffs) == 1 else self.recirculation_index
             )
-            source -= (
-                self.cfg.ortho_mix_coeffs[coeff_index]
-                * projection
-                * destination
-            )
+            coefficient = self.cfg.ortho_mix_coeffs[coeff_index]
+            for history_index, previous_destination in enumerate(
+                self.h_d_history[:-1]
+            ):
+                previous_destination = previous_destination.to(
+                    device=input_device, dtype=torch.float32
+                )
+                projection = (source * previous_destination).sum(
+                    dim=-1, keepdim=True
+                ) / previous_destination.square().sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(self.cfg.eps)
+                if history_index == len(
+                    self.magnitude_diff_stats.projection_sums
+                ):
+                    self.magnitude_diff_stats.projection_sums.append(0.0)
+                    self.magnitude_diff_stats.projection_counts.append(0)
+                self.magnitude_diff_stats.projection_sums[history_index] += (
+                    projection.sum().item()
+                )
+                self.magnitude_diff_stats.projection_counts[history_index] += (
+                    projection.numel()
+                )
+                source -= coefficient * projection * previous_destination
 
         if self.expected_embedding is not None or self.cfg.ortho_mix:
             source_norm_after = torch.linalg.vector_norm(
@@ -306,6 +331,7 @@ def recirculate(
             if select_expert_subset is not None:
                 select_expert_subset(0)
             hooks.h_d = hooks.h_s = None
+            hooks.h_d_history.clear()
             hooks.mode = "capture"
             first_logits, cache = step(token, cache)
             hooks.mode = "off"

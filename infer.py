@@ -95,7 +95,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--ortho-mix-coeffs",
         type=float,
         nargs="+",
-        default=[0.1, 0.15],
+        default=[0.1],
         metavar="COEFF",
         help=(
             "Projection-removal coefficients used by --ortho-mix. Provide one "
@@ -126,8 +126,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Arguments before this option form the baseline. Each argument after "
-            "it creates a separate run overriding only that argument. With no "
-            "following arguments, run the baseline only."
+            "it creates a separate run; comma-connected options are applied to "
+            "the same run (for example, --passes=2,--ortho-mix). With no following "
+            "arguments, run the baseline only."
         ),
     )
     parser.add_argument(
@@ -177,10 +178,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.ablations = None
         return args
 
-    ablations: list[tuple[str, Any]] = []
+    ablations: list[tuple[tuple[str, Any], ...]] = []
     index = 0
     while index < len(ablations_argv):
         option = ablations_argv[index]
+        connected_options = option.split(",")
+        if len(connected_options) > 1:
+            overrides: list[tuple[str, Any]] = []
+            for connected_option in connected_options:
+                option_name, separator, _value = connected_option.partition("=")
+                action = parser._option_string_actions.get(option_name)
+                if action is None or action.dest == "ablations":
+                    parser.error(f"invalid ablation argument: {option_name}")
+                if not separator and action.nargs != 0:
+                    parser.error(
+                        f"comma-connected argument {option_name} must use =VALUE"
+                    )
+
+                variation = parser.parse_args([*baseline_argv, connected_option])
+                is_boolean_option = action.nargs == 0 and isinstance(action.const, bool)
+                ablation_value = (
+                    not getattr(args, action.dest)
+                    if is_boolean_option
+                    else getattr(variation, action.dest)
+                )
+                overrides.append((action.dest, ablation_value))
+            ablations.append(tuple(overrides))
+            index += 1
+            continue
+
         option_name, separator, _value = option.partition("=")
         action = parser._option_string_actions.get(option_name)
         if action is None or action.dest == "ablations":
@@ -219,7 +245,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             if is_boolean_option
             else getattr(variation, action.dest)
         )
-        ablations.append((action.dest, ablation_value))
+        ablations.append(((action.dest, ablation_value),))
         index += 1
 
     args.ablations = tuple(ablations)
@@ -460,8 +486,14 @@ def sample_token(logits: Tensor, temperature: float) -> Tensor:
 
 
 def format_run_arguments(args: argparse.Namespace, options: Sequence[str]) -> str:
+    values = {
+        option: args.ortho_mix and args.passes > 1
+        if option == "ortho_mix"
+        else getattr(args, option)
+        for option in options
+    }
     return ", ".join(
-        f"{option.replace('_', '-')}={getattr(args, option)}" for option in options
+        f"{option.replace('_', '-')}={value}" for option, value in values.items()
     )
 
 
@@ -644,6 +676,11 @@ def main() -> None:
 
         if use_recirculation and magnitude_diff_stats.mean is not None:
             print(f"magnitude_diff_stats.mean = {magnitude_diff_stats.mean:.3f}")
+        if use_recirculation and magnitude_diff_stats.projection_means:
+            projection_means = [
+                round(mean, 3) for mean in magnitude_diff_stats.projection_means
+            ]
+            print(f"projection_means = {projection_means}")
             
         return generated_ids
 
@@ -707,13 +744,21 @@ def main() -> None:
     if args.ablations is False or args.ablations is None:
         runs = [(args, True, "Recirculation ON")]
     else:
-        ablated_options = tuple(dict.fromkeys(option for option, _ in args.ablations))
-        baseline_arguments = format_run_arguments(args, ablated_options)
+        ablated_options = tuple(
+            dict.fromkeys(
+                option
+                for overrides in args.ablations
+                for option, _ in overrides
+            )
+        )
+        label_options = tuple(dict.fromkeys((*ablated_options, "ortho_mix")))
+        baseline_arguments = format_run_arguments(args, label_options)
         runs = [(args, True, f"Baseline: {baseline_arguments}")]
-        for option, value in args.ablations:
+        for overrides in args.ablations:
             ablation_args = argparse.Namespace(**vars(args))
-            setattr(ablation_args, option, value)
-            arguments = format_run_arguments(ablation_args, ablated_options)
+            for option, value in overrides:
+                setattr(ablation_args, option, value)
+            arguments = format_run_arguments(ablation_args, label_options)
             runs.append((ablation_args, True, f"Ablation: {arguments}"))
 
     for run_index, (run_args, use_recirculation, label) in enumerate(runs):
