@@ -43,7 +43,7 @@ class RecirculationConfig:
     eps: float = 1e-8
     mode: Literal["source", "layerwise"] = "source"
     ortho_mix: bool = False
-    ortho_mix_coeff: float = 0.1
+    ortho_mix_coeffs: tuple[float, ...] = (0.1,)
 
 
 @dataclass
@@ -77,6 +77,7 @@ class _Hooks:
         self.h_d: Tensor | None = None
         self.h_s: Tensor | None = None
         self.expected_embedding: Tensor | None = None
+        self.recirculation_index = 0
         self.magnitude_diff_stats = magnitude_diff_stats
         self.handles = (
             blocks[cfg.destination].register_forward_hook(self._save_destination),
@@ -128,7 +129,14 @@ class _Hooks:
             # projection = projection.clamp_max(0.5)
             # The overall removed relative magnitude is 0.5*0.5 = 0.25.
             # breakpoint()
-            source -= self.cfg.ortho_mix_coeff * projection * destination
+            coeff_index = (
+                0 if len(self.cfg.ortho_mix_coeffs) == 1 else self.recirculation_index
+            )
+            source -= (
+                self.cfg.ortho_mix_coeffs[coeff_index]
+                * projection
+                * destination
+            )
 
         if self.expected_embedding is not None or self.cfg.ortho_mix:
             source_norm_after = torch.linalg.vector_norm(
@@ -254,6 +262,14 @@ def recirculate(
 
     if passes < 1:
         raise ValueError("passes must be at least 1.")
+    recirculation_count = passes - 1
+    if not config.ortho_mix_coeffs:
+        raise ValueError("ortho_mix_coeffs must contain at least one value.")
+    if len(config.ortho_mix_coeffs) not in (1, recirculation_count):
+        raise ValueError(
+            "ortho_mix_coeffs must contain one value or one value per "
+            f"recirculation ({recirculation_count} for {passes} passes)."
+        )
 
     if config.mode == "layerwise":
         if rewind_layer is None:
@@ -304,6 +320,7 @@ def recirculate(
                     if expected_embedding is not None
                     else None
                 )
+                hooks.recirculation_index = pass_index - 1
                 hooks.mode = "inject"
                 final_logits, cache = step(token, cache)
                 hooks.mode = "off"

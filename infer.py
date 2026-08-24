@@ -92,10 +92,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Remove the source component parallel to the destination before mixing.",
     )
     parser.add_argument(
-        "--ortho_mix_coeff",
+        "--ortho-mix-coeffs",
         type=float,
-        default=0.1,
-        help="Projection-removal coefficient used by --ortho-mix (default: 0.1).",
+        nargs="+",
+        default=[0.1, 0.15],
+        metavar="COEFF",
+        help=(
+            "Projection-removal coefficients used by --ortho-mix. Provide one "
+            "value for all recirculations or one per recirculation (default: 0.1)."
+        ),
     )
     parser.add_argument(
         "--passes",
@@ -187,6 +192,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 value_count = 1
             elif isinstance(action.nargs, int):
                 value_count = action.nargs
+            elif action.nargs == "+":
+                value_count = 0
+                for value in ablations_argv[index + 1 :]:
+                    next_option = value.partition("=")[0]
+                    if next_option in parser._option_string_actions:
+                        break
+                    value_count += 1
+                if value_count == 0:
+                    parser.error(f"argument {option_name} expected at least one value")
             else:
                 parser.error(
                     f"ablation does not support variable-length argument {option_name}"
@@ -647,7 +661,7 @@ def main() -> None:
             alpha=run_args.alpha,
             beta=run_args.beta,
             ortho_mix=run_args.ortho_mix,
-            ortho_mix_coeff=run_args.ortho_mix_coeff,
+            ortho_mix_coeffs=tuple(run_args.ortho_mix_coeffs),
             mode=run_args.mode,
         )
         if not 0 <= run_config.destination < run_config.source < len(blocks):
@@ -690,12 +704,7 @@ def main() -> None:
                 expert_shards.close()
 
     prompt_length = input_ids.shape[1]
-    if args.ablations is False:
-        runs = [
-            (args, False, "Recirculation OFF"),
-            (args, True, "Recirculation ON"),
-        ]
-    elif args.ablations is None:
+    if args.ablations is False or args.ablations is None:
         runs = [(args, True, "Recirculation ON")]
     else:
         ablated_options = tuple(dict.fromkeys(option for option, _ in args.ablations))
