@@ -10,6 +10,9 @@ In source-to-destination mode, for every token (with three passes):
     4. Capture the new residuals, rewind, and repeat the recirculation once more.
     5. Return the final-pass logits and commit its KV cache.
 
+When expected-embedding subtraction is enabled, each replay subtracts the
+top-K expected next-token embedding from h_s before norm matching and mixing.
+
 In layerwise mode, each block from destination through source is run ``passes``
 times in place, feeding each pass output into the next pass after matching the
 original input norm. Each extra pass replaces that layer's previous KV entry,
@@ -39,6 +42,18 @@ class RecirculationConfig:
     beta: float | None = None  # None selects the convex mix: beta = 1 - alpha.
     eps: float = 1e-8
     mode: Literal["source", "layerwise"] = "source"
+    ortho_mix: bool = False
+    ortho_mix_coeff: float = 0.1
+
+
+@dataclass
+class MagnitudeDiffStats:
+    fraction_sum: float = 0.0
+    count: int = 0
+
+    @property
+    def mean(self) -> float | None:
+        return self.fraction_sum / self.count if self.count else None
 
 
 def _residual(output: Any) -> Tensor:
@@ -49,13 +64,20 @@ def _residual(output: Any) -> Tensor:
 
 
 class _Hooks:
-    def __init__(self, blocks: Sequence[nn.Module], cfg: RecirculationConfig) -> None:
+    def __init__(
+        self,
+        blocks: Sequence[nn.Module],
+        cfg: RecirculationConfig,
+        magnitude_diff_stats: MagnitudeDiffStats,
+    ) -> None:
         if not 0 <= cfg.destination < cfg.source < len(blocks):
             raise ValueError("Expected 0 <= destination < source < number of blocks.")
         self.cfg = cfg
         self.mode = "off"
         self.h_d: Tensor | None = None
         self.h_s: Tensor | None = None
+        self.expected_embedding: Tensor | None = None
+        self.magnitude_diff_stats = magnitude_diff_stats
         self.handles = (
             blocks[cfg.destination].register_forward_hook(self._save_destination),
             blocks[cfg.source].register_forward_hook(self._save_source),
@@ -79,10 +101,47 @@ class _Hooks:
         input_device = _residual(inputs).device
         destination = self.h_d.to(device=input_device, dtype=torch.float32)
         source = self.h_s.to(device=input_device, dtype=torch.float32)
+        source_norm_before = torch.linalg.vector_norm(
+            source, dim=-1, keepdim=True
+        )
         source *= torch.linalg.vector_norm(destination, dim=-1, keepdim=True) / (
             torch.linalg.vector_norm(source, dim=-1, keepdim=True).clamp_min(self.cfg.eps)
         )
+
+        if self.expected_embedding is not None:
+            expected = self.expected_embedding.to(
+                device=input_device, dtype=torch.float32
+            )
+            projection = (source * expected).sum(dim=-1, keepdim=True) / (
+                expected.square().sum(dim=-1, keepdim=True).clamp_min(self.cfg.eps)
+            )
+            source -= projection * expected
+
         beta = 1.0 - self.cfg.alpha if self.cfg.beta is None else self.cfg.beta
+        if self.cfg.ortho_mix:
+            projection = (source * destination).sum(dim=-1, keepdim=True) / (
+                destination.square().sum(dim=-1, keepdim=True).clamp_min(
+                    self.cfg.eps
+                )
+            )
+            # print(f"projection.max() = {projection.max().item():.3f}")
+            # projection = projection.clamp_max(0.5)
+            # The overall removed relative magnitude is 0.5*0.5 = 0.25.
+            # breakpoint()
+            source -= self.cfg.ortho_mix_coeff * projection * destination
+
+        if self.expected_embedding is not None or self.cfg.ortho_mix:
+            source_norm_after = torch.linalg.vector_norm(
+                source, dim=-1, keepdim=True
+            )
+            magnitude_diff_fraction = (
+                source_norm_before - source_norm_after
+            ) / source_norm_before.clamp_min(self.cfg.eps)
+            self.magnitude_diff_stats.fraction_sum += (
+                magnitude_diff_fraction.sum().item()
+            )
+            self.magnitude_diff_stats.count += magnitude_diff_fraction.numel()
+
         mixed = (beta * destination + self.cfg.alpha * source).to(inputs[0].dtype)
         return (mixed, *inputs[1:])
 
@@ -186,6 +245,8 @@ def recirculate(
     rewind_one: Callable[[Any], Any],
     config: RecirculationConfig,
     select_expert_subset: Callable[[int], None] | None = None,
+    expected_embedding: Callable[[Tensor], Tensor] | None = None,
+    magnitude_diff_stats: MagnitudeDiffStats | None = None,
     passes: int = 3,
     rewind_layer: Callable[[Any, int], Any] | None = None,
 ) -> tuple[Tensor, Any]:
@@ -221,7 +282,7 @@ def recirculate(
         return torch.cat(logits, dim=1), hooks.cache
 
     logits = []
-    hooks = _Hooks(blocks, config)
+    hooks = _Hooks(blocks, config, magnitude_diff_stats or MagnitudeDiffStats())
     try:
         for position in range(input_ids.shape[1]):
             token = input_ids[:, position : position + 1]
@@ -238,6 +299,11 @@ def recirculate(
                 cache = rewind_one(cache)
                 if select_expert_subset is not None:
                     select_expert_subset(pass_index)
+                hooks.expected_embedding = (
+                    expected_embedding(final_logits[:, -1:, :])
+                    if expected_embedding is not None
+                    else None
+                )
                 hooks.mode = "inject"
                 final_logits, cache = step(token, cache)
                 hooks.mode = "off"

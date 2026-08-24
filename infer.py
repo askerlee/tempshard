@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import sys
 import time
 from collections.abc import Sequence
 from itertools import combinations
@@ -11,7 +12,7 @@ import torch
 from torch import Tensor, nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-from recirculation import RecirculationConfig, recirculate
+from recirculation import MagnitudeDiffStats, RecirculationConfig, recirculate
 
 
 EXAMPLE_QUERIES = (
@@ -25,10 +26,21 @@ EXAMPLE_QUERIES = (
     "A small software team must choose between shipping a fragile feature this week or delaying it for testing while a competitor is launching a similar product. Build a decision framework, evaluate the main risks, and recommend a course of action under clearly stated assumptions.",
     "Plan how to prepare tea for six guests when there is one kettle, four clean mugs, two dirty mugs, and one guest avoids caffeine. Include ordering, resource constraints, and a contingency if the kettle stops working.",
     "A store is considering a 25% discount followed by a loyalty reward, but margins are thin and customers respond differently to promotions. Explain how the store should evaluate profitability, customer behavior, and long-term effects before choosing a promotion design.",
+    "A coastal town must decide whether to rebuild a storm-damaged seawall, restore wetlands, or relocate the most exposed homes. Compare the options across cost, resilience, fairness, and uncertainty, then propose a decision process that can adapt as conditions change.",
+    "A hospital has fewer intensive-care beds than patients likely to need them during an outbreak. Design a transparent allocation policy, explain how it handles changing prognoses and ties, and identify safeguards against bias and avoidable harm.",
+    "Two departments report conflicting results from the same customer survey: one says satisfaction improved, while the other says complaints became more severe. Explain how both claims could be true and outline an analysis that would reconcile the evidence.",
+    "A teacher discovers that students are using generative AI for homework, but the school has no clear policy. Develop a response that supports learning, treats students fairly, and distinguishes acceptable assistance from work that misrepresents understanding.",
+    "An old bridge is still considered safe but requires increasingly frequent repairs. Compare continued maintenance, major rehabilitation, and replacement while accounting for disruption, uncertain future demand, public safety, and budget constraints.",
+    "A neighborhood wants more housing but disagrees about building height, affordability requirements, parking, and preservation of local businesses. Propose a negotiation framework and a compromise plan, including who bears each cost and how outcomes should be measured.",
+    "A research team finds a statistically significant effect that is much smaller than expected and disappears under one reasonable analysis choice. Interpret the result, identify what should be reported, and recommend the next study without reducing the decision to a single p-value.",
+    "A family must choose between caring for an aging relative at home, hiring in-home support, or moving them to assisted living. Build a respectful decision process that considers autonomy, safety, finances, caregiver capacity, and how the plan should be revisited over time.",
+    "A news platform wants to reduce misinformation without suppressing legitimate disagreement or breaking-news updates that later change. Design a moderation approach that combines labels, distribution rules, appeals, and evidence standards, then explain its likely failure modes.",
+    "A manufacturer can lower emissions by replacing equipment now, purchasing cleaner electricity, or waiting for a promising technology still under development. Recommend a staged strategy using plausible assumptions about cost, risk, and regulation, and specify signals that would trigger a change in course.",
 )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         description="Generate text with multi-pass residual-stream recirculation."
     )
@@ -75,16 +87,43 @@ def parse_args() -> argparse.Namespace:
         help="Defaults to 1 - alpha.",
     )
     parser.add_argument(
+        "--ortho-mix",
+        action="store_true",
+        help="Remove the source component parallel to the destination before mixing.",
+    )
+    parser.add_argument(
+        "--ortho_mix_coeff",
+        type=float,
+        default=0.1,
+        help="Projection-removal coefficient used by --ortho-mix (default: 0.1).",
+    )
+    parser.add_argument(
         "--passes",
         type=int,
         default=2,
         help="Total model passes per token, including the initial pass (default: 2).",
     )
+    parser.add_argument(
+        "--exp_emb",
+        action="store_true",
+        help="Subtract the top-K expected token embedding from the source latent.",
+    )
+    parser.add_argument(
+        "--exp_emb_K",
+        type=int,
+        default=1,
+        metavar="K",
+        help="Number of tokens used for the expected embedding (default: 1).",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=300)
     parser.add_argument(
-        "--skip-baseline",
+        "--ablations",
         action="store_true",
-        help="Skip the Recirculation OFF generation run.",
+        help=(
+            "Arguments before this option form the baseline. Each argument after "
+            "it creates a separate run overriding only that argument. With no "
+            "following arguments, run the baseline only."
+        ),
     )
     parser.add_argument(
         "--tempshard",
@@ -120,7 +159,57 @@ def parse_args() -> argparse.Namespace:
         default="46GiB",
         help="Maximum model memory per GPU when sharding (default: 46GiB).",
     )
-    return parser.parse_args()
+    if "--ablations" not in argv:
+        args = parser.parse_args(argv)
+        args.ablations = False
+        return args
+
+    ablations_index = argv.index("--ablations")
+    baseline_argv = argv[:ablations_index]
+    ablations_argv = argv[ablations_index + 1 :]
+    args = parser.parse_args(baseline_argv)
+    if not ablations_argv:
+        args.ablations = None
+        return args
+
+    ablations: list[tuple[str, Any]] = []
+    index = 0
+    while index < len(ablations_argv):
+        option = ablations_argv[index]
+        option_name, separator, _value = option.partition("=")
+        action = parser._option_string_actions.get(option_name)
+        if action is None or action.dest == "ablations":
+            parser.error(f"invalid ablation argument: {option_name}")
+
+        argument_group = [option]
+        if not separator and action.nargs != 0:
+            if action.nargs is None:
+                value_count = 1
+            elif isinstance(action.nargs, int):
+                value_count = action.nargs
+            else:
+                parser.error(
+                    f"ablation does not support variable-length argument {option_name}"
+                )
+            argument_group.extend(
+                ablations_argv[index + 1 : index + 1 + value_count]
+            )
+            if len(argument_group) != value_count + 1:
+                parser.error(f"argument {option_name} expected {value_count} value(s)")
+            index += value_count
+
+        variation = parser.parse_args([*baseline_argv, *argument_group])
+        is_boolean_option = action.nargs == 0 and isinstance(action.const, bool)
+        ablation_value = (
+            not getattr(args, action.dest)
+            if is_boolean_option
+            else getattr(variation, action.dest)
+        )
+        ablations.append((action.dest, ablation_value))
+        index += 1
+
+    args.ablations = tuple(ablations)
+    return args
 
 
 def choose_device(requested: str) -> torch.device:
@@ -356,6 +445,12 @@ def sample_token(logits: Tensor, temperature: float) -> Tensor:
     return torch.multinomial(probabilities, num_samples=1)
 
 
+def format_run_arguments(args: argparse.Namespace, options: Sequence[str]) -> str:
+    return ", ".join(
+        f"{option.replace('_', '-')}={getattr(args, option)}" for option in options
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.list_queries:
@@ -367,6 +462,20 @@ def main() -> None:
         raise ValueError("--max-new-tokens must be nonnegative.")
     if args.passes < 1:
         raise ValueError("--passes must be at least 1.")
+    if args.exp_emb_K < 1:
+        raise ValueError("--exp_emb_K must be at least 1.")
+    if args.exp_emb and (
+        args.mode != "source" or args.source != -1 or args.destination != 0
+    ):
+        print(
+            "--exp_emb overrides "
+            f"--mode {args.mode} --source {args.source} --destination {args.destination} "
+            "with --mode source --source -1 --destination 0."
+        )
+        args.mode = "source"
+        #args.source = -1
+        #args.destination = 0
+
     if args.temperature < 0:
         raise ValueError("--temperature must be nonnegative.")
     if not 0.0 <= args.expert_overlap < 1.0:
@@ -394,37 +503,19 @@ def main() -> None:
     model.eval()
     input_device = model.get_input_embeddings().weight.device
 
+    def expected_embedding(logits: Tensor, requested_top_k: int) -> Tensor:
+        embedding = model.get_input_embeddings()
+        top_k = min(requested_top_k, logits.shape[-1])
+        top_logits, token_ids = torch.topk(logits, top_k, dim=-1)
+        probabilities = torch.softmax(top_logits, dtype=torch.float32, dim=-1)
+        token_embeddings = embedding(token_ids.to(embedding.weight.device))
+        return torch.sum(
+            probabilities.to(token_embeddings.device).unsqueeze(-1)
+            * token_embeddings.to(dtype=torch.float32),
+            dim=-2,
+        ).to(dtype=token_embeddings.dtype)
+
     blocks = find_decoder_blocks(model)
-    config = RecirculationConfig(
-        destination=args.destination,
-        source=resolve_source(args.source, len(blocks)),
-        alpha=args.alpha,
-        beta=args.beta,
-        mode=args.mode,
-    )
-    if not 0 <= config.destination < config.source < len(blocks):
-        raise ValueError(
-            f"The model has {len(blocks)} decoder blocks, but the requested "
-            f"indices were destination={config.destination}, source={config.source}."
-        )
-    sharded_blocks = (
-        blocks[config.destination : config.source + 1]
-        if config.mode == "layerwise"
-        else blocks[config.destination :]
-    )
-    expert_shards = (
-        TemporalExpertShards(
-            sharded_blocks,
-            num_shards=args.passes,
-            seed=args.seed,
-            overlap=args.expert_overlap,
-        )
-        if args.tempshard
-        else None
-    )
-    if expert_shards is not None and not expert_shards.is_moe:
-        expert_shards.close()
-        expert_shards = None
 
     def step(token: Tensor, cache: DynamicCache) -> tuple[Tensor, DynamicCache]:
         past_length = cache.get_seq_length()
@@ -467,16 +558,28 @@ def main() -> None:
         eos_token_ids = [eos_token_ids]
     eos_token_ids = set(eos_token_ids or [])
 
-    def generate(use_recirculation: bool) -> Tensor:
-        torch.manual_seed(args.seed)
+    def generate(
+        use_recirculation: bool,
+        run_args: argparse.Namespace,
+        run_config: RecirculationConfig,
+        expert_shards: TemporalExpertShards | None,
+    ) -> Tensor:
+        torch.manual_seed(run_args.seed)
+        magnitude_diff_stats = MagnitudeDiffStats()
+        use_expert_shards = expert_shards is not None and run_args.tempshard
         if expert_shards is not None:
-            if use_recirculation:
+            if use_recirculation and use_expert_shards:
                 expert_shards.select(0)
             else:
                 expert_shards.disable()
         cache = DynamicCache(config=model.config)
         if use_recirculation:
             cache.activate_past_recording()
+        expected_embedding_fn = (
+            (lambda logits: expected_embedding(logits, run_args.exp_emb_K))
+            if run_args.exp_emb
+            else None
+        )
 
         if use_recirculation:
             prompt_logits, cache = recirculate(
@@ -485,9 +588,11 @@ def main() -> None:
                 cache=cache,
                 step=step,
                 rewind_one=rewind_dynamic_cache,
-                config=config,
-                select_expert_subset=expert_shards.select if expert_shards else None,
-                passes=args.passes,
+                config=run_config,
+                select_expert_subset=expert_shards.select if use_expert_shards else None,
+                expected_embedding=expected_embedding_fn,
+                magnitude_diff_stats=magnitude_diff_stats,
+                passes=run_args.passes,
                 rewind_layer=rewind_dynamic_cache_layer,
             )
             next_logits = prompt_logits[:, -1, :]
@@ -498,8 +603,8 @@ def main() -> None:
             next_logits = token_logits[:, -1, :]
 
         generated_ids = input_ids.clone()
-        for _ in range(args.max_new_tokens):
-            next_token = sample_token(next_logits, args.temperature)
+        for _ in range(run_args.max_new_tokens):
+            next_token = sample_token(next_logits, run_args.temperature)
             generated_ids = torch.cat((generated_ids, next_token), dim=1)
 
             if next_token.item() in eos_token_ids:
@@ -512,15 +617,20 @@ def main() -> None:
                     cache=cache,
                     step=step,
                     rewind_one=rewind_dynamic_cache,
-                    config=config,
-                    select_expert_subset=expert_shards.select if expert_shards else None,
-                    passes=args.passes,
+                    config=run_config,
+                    select_expert_subset=expert_shards.select if use_expert_shards else None,
+                    expected_embedding=expected_embedding_fn,
+                    magnitude_diff_stats=magnitude_diff_stats,
+                    passes=run_args.passes,
                     rewind_layer=rewind_dynamic_cache_layer,
                 )
             else:
                 token_logits, cache = step(next_token, cache)
             next_logits = token_logits[:, -1, :]
 
+        if use_recirculation and magnitude_diff_stats.mean is not None:
+            print(f"magnitude_diff_stats.mean = {magnitude_diff_stats.mean:.3f}")
+            
         return generated_ids
 
     def synchronize_devices() -> None:
@@ -528,34 +638,88 @@ def main() -> None:
             for gpu in range(torch.cuda.device_count()):
                 torch.cuda.synchronize(gpu)
 
-    def timed_generate(use_recirculation: bool) -> tuple[Tensor, float]:
+    def timed_generate(
+        use_recirculation: bool, run_args: argparse.Namespace
+    ) -> tuple[Tensor, float]:
+        run_config = RecirculationConfig(
+            destination=run_args.destination,
+            source=resolve_source(run_args.source, len(blocks)),
+            alpha=run_args.alpha,
+            beta=run_args.beta,
+            ortho_mix=run_args.ortho_mix,
+            ortho_mix_coeff=run_args.ortho_mix_coeff,
+            mode=run_args.mode,
+        )
+        if not 0 <= run_config.destination < run_config.source < len(blocks):
+            raise ValueError(
+                f"The model has {len(blocks)} decoder blocks, but the requested "
+                f"indices were destination={run_config.destination}, "
+                f"source={run_config.source}."
+            )
+        sharded_blocks = (
+            blocks[run_config.destination : run_config.source + 1]
+            if run_config.mode == "layerwise"
+            else blocks[run_config.destination :]
+        )
+        expert_shards = (
+            TemporalExpertShards(
+                sharded_blocks,
+                num_shards=run_args.passes,
+                seed=run_args.seed,
+                overlap=run_args.expert_overlap,
+            )
+            if use_recirculation and run_args.tempshard
+            else None
+        )
+        if expert_shards is not None and not expert_shards.is_moe:
+            expert_shards.close()
+            expert_shards = None
         synchronize_devices()
         start = time.perf_counter()
-        generated_ids = generate(use_recirculation=use_recirculation)
-        synchronize_devices()
-        return generated_ids, time.perf_counter() - start
+        try:
+            generated_ids = generate(
+                use_recirculation=use_recirculation,
+                run_args=run_args,
+                run_config=run_config,
+                expert_shards=expert_shards,
+            )
+            synchronize_devices()
+            return generated_ids, time.perf_counter() - start
+        finally:
+            if expert_shards is not None:
+                expert_shards.close()
 
     prompt_length = input_ids.shape[1]
-    if not args.skip_baseline:
-        baseline_ids, baseline_seconds = timed_generate(use_recirculation=False)
-        print(f"=== Recirculation OFF ({baseline_seconds:.3f} s) ===")
+    if args.ablations is False:
+        runs = [
+            (args, False, "Recirculation OFF"),
+            (args, True, "Recirculation ON"),
+        ]
+    elif args.ablations is None:
+        runs = [(args, True, "Recirculation ON")]
+    else:
+        ablated_options = tuple(dict.fromkeys(option for option, _ in args.ablations))
+        baseline_arguments = format_run_arguments(args, ablated_options)
+        runs = [(args, True, f"Baseline: {baseline_arguments}")]
+        for option, value in args.ablations:
+            ablation_args = argparse.Namespace(**vars(args))
+            setattr(ablation_args, option, value)
+            arguments = format_run_arguments(ablation_args, ablated_options)
+            runs.append((ablation_args, True, f"Ablation: {arguments}"))
+
+    for run_index, (run_args, use_recirculation, label) in enumerate(runs):
+        run_ids, run_seconds = timed_generate(
+            use_recirculation=use_recirculation, run_args=run_args
+        )
+        if run_index == 0:
+            print("\n=== Query ===")
+            print(prompt)
+        print(f"\n=== {label} ({run_seconds:.3f} s) ===")
         print(
             tokenizer.decode(
-                baseline_ids[0, prompt_length:], skip_special_tokens=True
+                run_ids[0, prompt_length:], skip_special_tokens=True
             )
         )
-
-    recirculated_ids, recirculated_seconds = timed_generate(use_recirculation=True)
-    if expert_shards is not None:
-        expert_shards.close()
-
-    heading_prefix = "" if args.skip_baseline else "\n"
-    print(f"{heading_prefix}=== Recirculation ON ({recirculated_seconds:.3f} s) ===")
-    print(
-        tokenizer.decode(
-            recirculated_ids[0, prompt_length:], skip_special_tokens=True
-        )
-    )
 
 
 if __name__ == "__main__":
