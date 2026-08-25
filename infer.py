@@ -48,7 +48,20 @@ EXAMPLE_QUERIES = (
 
 def parse_results(path: Path) -> list[tuple[str, list[tuple[str, str]]]]:
     text = path.read_text(encoding="utf-8")
-    sections = re.split(r"\n=== Query ===\n", text)[1:]
+    try:
+        records = json.loads(text)
+    except json.JSONDecodeError:
+        records = None
+    if records is not None:
+        return [
+            (
+                record["prompt"],
+                [(run["label"], run["output"]) for run in record["runs"]],
+            )
+            for record in records
+        ]
+
+    sections = re.split(r"\n=== Query(?: \d+)? ===\n", text)[1:]
     parsed: list[tuple[str, list[tuple[str, str]]]] = []
     header = re.compile(r"\n=== (Baseline|Ablation): ([^\n]+) \([^\n]+\) ===\n")
     for section in sections:
@@ -376,8 +389,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default="results.txt",
-        help="Save the query and generated output report to this file.",
+        default="results.json",
+        help="Save queries and generated outputs as pretty JSON.",
     )
     parser.add_argument(
         "--similarities-output",
@@ -1297,21 +1310,34 @@ def main() -> None:
         if args.prompt is not None
         else tuple(EXAMPLE_QUERIES[index - 1] for index in args.query_indices)
     )
-    output_file = args.output.open("w", encoding="utf-8") if args.output else None
+    output_file = args.output.open("w+", encoding="utf-8") if args.output else None
     similarities_file = (
         args.similarities_output.open("w", encoding="utf-8")
         if args.debug and args.similarities_output
         else None
     )
+    output_records: list[dict[str, Any]] = []
     similarity_records: list[dict[str, Any]] = []
 
     def emit(text: str) -> None:
         print(text)
+
+    def save_output() -> None:
         if output_file is not None:
-            print(text, file=output_file, flush=True)
+            output_file.seek(0)
+            json.dump(output_records, output_file, ensure_ascii=False, indent=2)
+            output_file.write("\n")
+            output_file.truncate()
+            output_file.flush()
 
     try:
-        for prompt in prompts:
+        for prompt_index, prompt in enumerate(prompts, start=1):
+            query_record: dict[str, Any] = {
+                "index": prompt_index,
+                "prompt": prompt,
+                "runs": [],
+            }
+            output_records.append(query_record)
             encoded_prompt = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 tokenize=True,
@@ -1329,14 +1355,19 @@ def main() -> None:
                     use_recirculation=use_recirculation, run_args=run_args
                 )
                 if run_index == 0:
-                    emit("\n=== Query ===")
+                    emit(f"\n=== Query {prompt_index} ===")
                     emit(prompt)
                 emit(f"\n=== {label} ({run_seconds:.3f} s) ===")
-                emit(
-                    tokenizer.decode(
-                        run_ids[0, prompt_length:], skip_special_tokens=True
-                    )
+                output = tokenizer.decode(
+                    run_ids[0, prompt_length:], skip_special_tokens=True
                 )
+                emit(output)
+                query_record["runs"].append({
+                    "label": label,
+                    "seconds": run_seconds,
+                    "output": output,
+                })
+                save_output()
                 if similarities_file is not None:
                     similarity_records.append({
                         "prompt": prompt,
