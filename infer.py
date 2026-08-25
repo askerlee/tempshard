@@ -367,8 +367,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--similarities-output",
         type=Path,
-        default=Path("similarities.jsonl"),
-        help="Write one debug-run record containing per-token similarities.",
+        default=Path("similarities.json"),
+        help="Write pretty-printed debug-run records with per-token similarities.",
     )
     parser.add_argument(
         "--evaluate-results",
@@ -1042,6 +1042,47 @@ def main() -> None:
         synchronize_devices()
         teacher_cache = DynamicCache(config=teacher_model.config)
 
+        teacher_blocks = find_decoder_blocks(teacher_model)
+        teacher_activations: dict[str, Tensor] = {}
+
+        def capture_teacher_activation(name: str) -> Callable[..., None]:
+            def capture(
+                _module: nn.Module, _inputs: tuple[Any, ...], output: Any
+            ) -> None:
+                residual = output[0] if isinstance(output, tuple) else output
+                if not isinstance(residual, Tensor):
+                    raise TypeError(
+                        "A teacher transformer block must return its residual "
+                        "stream first."
+                    )
+                teacher_activations[name] = residual[:, -1, :].detach().clone()
+
+            return capture
+
+        teacher_activation_handles = (
+            teacher_blocks[run_config.destination].register_forward_hook(
+                capture_teacher_activation("destination")
+            ),
+            teacher_blocks[run_config.source].register_forward_hook(
+                capture_teacher_activation("source")
+            ),
+        )
+
+        def teacher_activation_similarity() -> float:
+            try:
+                destination = teacher_activations["destination"].float()
+                source = teacher_activations["source"].to(
+                    destination.device, dtype=torch.float32
+                )
+            except KeyError as error:
+                raise RuntimeError(
+                    "Teacher source/destination activations were not captured."
+                ) from error
+            cosine = torch.nn.functional.cosine_similarity(
+                destination, source, dim=-1
+            )
+            return round(float(cosine.mean().item()), 3)
+
         def student_prefill() -> tuple[Tensor, DynamicCache]:
             if use_recirculation:
                 return recirculate(
@@ -1093,6 +1134,9 @@ def main() -> None:
                 comparison = distribution_similarity(
                     teacher_next_logits, student_next_logits
                 )
+                comparison["teacher_src_dst_sim"] = (
+                    teacher_activation_similarity()
+                )
                 next_token = sample_token(
                     student_next_logits, run_args.temperature
                 )
@@ -1134,6 +1178,9 @@ def main() -> None:
                 student_logits, student_cache = student_future.result()
                 teacher_next_logits = teacher_logits[:, -1, :]
                 student_next_logits = student_logits[:, -1, :]
+
+        for handle in teacher_activation_handles:
+            handle.remove()
 
         if use_recirculation and magnitude_diff_stats.mean is not None:
             print(f"magnitude_diff_stats.mean = {magnitude_diff_stats.mean:.3f}")
@@ -1232,6 +1279,7 @@ def main() -> None:
         if args.debug and args.similarities_output
         else None
     )
+    similarity_records: list[dict[str, Any]] = []
 
     def emit(text: str) -> None:
         print(text)
@@ -1266,20 +1314,22 @@ def main() -> None:
                     )
                 )
                 if similarities_file is not None:
-                    record = {
+                    similarity_records.append({
                         "prompt": prompt,
                         "run": label,
                         "similarities": similarities,
-                    }
-                    print(
-                        json.dumps(record, ensure_ascii=False),
-                        file=similarities_file,
-                    )
-                    similarities_file.flush()
+                    })
     finally:
         if output_file is not None:
             output_file.close()
         if similarities_file is not None:
+            json.dump(
+                similarity_records,
+                similarities_file,
+                ensure_ascii=False,
+                indent=2,
+            )
+            similarities_file.write("\n")
             similarities_file.close()
 
 
