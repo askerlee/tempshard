@@ -306,11 +306,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Recirculate only when the inference model's source/destination "
-            "activation similarity reaches --cond-recirculate-thres."
+            "activation similarity reaches --cond_recirculate_thres."
         ),
     )
     parser.add_argument(
-        "--cond-recirculate-thres",
+        "--cond_recirculate_thres",
         type=float,
         default=0.67,
         metavar="THRESHOLD",
@@ -1198,8 +1198,8 @@ def main() -> None:
                     student_future = executor.submit(
                         student_step, next_token, student_cache
                     )
-                teacher_logits, teacher_cache = teacher_future.result()
                 student_logits, student_cache = student_future.result()
+                teacher_logits, teacher_cache = teacher_future.result()
                 teacher_next_logits = teacher_logits[:, -1, :]
                 student_next_logits = student_logits[:, -1, :]
 

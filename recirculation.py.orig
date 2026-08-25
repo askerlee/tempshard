@@ -308,12 +308,12 @@ def recirculate(
             "ortho_mix_coeffs must contain one value or one value per "
             f"recirculation ({recirculation_count} for {passes} passes)."
         )
-
-    if config.mode == "layerwise":
         if condition_threshold is not None:
             raise ValueError(
                 "Conditional recirculation currently requires --mode source."
             )
+
+    if config.mode == "layerwise":
         if rewind_layer is None:
             raise ValueError("Layerwise mode requires rewind_layer.")
         logits = []
