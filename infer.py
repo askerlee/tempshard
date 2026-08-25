@@ -9,6 +9,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Sequence
 from itertools import combinations
 from pathlib import Path
@@ -229,16 +230,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Print the built-in queries and exit.",
     )
     parser.add_argument(
-        "--provider",
+        "--eval-provider",
         choices=("local", "openai"),
         default="openai",
         help="Use a local Transformers model or the OpenAI API for evaluation.",
     )
     parser.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B-FP8")
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Run parallel teacher/student inference and record distribution similarities.",
+    )
+    parser.add_argument(
+        "--teacher-model",
+        default=None,
+        help="Teacher checkpoint used by --debug (default: --model).",
+    )
+    parser.add_argument(
         "--evaluation-model",
-        default="gpt-5.6-terra",
-        help="Model used by the OpenAI evaluator (default: gpt-5.6-luna).",
+        default="gpt-5.6-sol",
+        help="Model used by the OpenAI evaluator (default: gpt-5.6-sol).",
     )
     parser.add_argument(
         "--openai-base-url",
@@ -352,6 +363,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         default="results.txt",
         help="Save the query and generated output report to this file.",
+    )
+    parser.add_argument(
+        "--similarities-output",
+        type=Path,
+        default=Path("similarities.jsonl"),
+        help="Write one debug-run record containing per-token similarities.",
     )
     parser.add_argument(
         "--evaluate-results",
@@ -727,12 +744,10 @@ def main() -> None:
     if not 0.0 <= args.expert_overlap < 1.0:
         raise ValueError("--expert-overlap must be in the range [0, 1).")
 
-    if args.provider == "openai":
-        if args.evaluate_results is None:
-            raise ValueError("--provider openai requires --evaluate-results.")
+    if args.eval_provider == "openai" and args.evaluate_results is not None:
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
-            raise RuntimeError("Set OPENAI_API_KEY before using --provider openai.")
+            raise RuntimeError("Set OPENAI_API_KEY before using --eval-provider openai.")
         write_evaluation_report(
             parse_results(args.evaluate_results),
             args.evaluation_output,
@@ -816,6 +831,20 @@ def main() -> None:
         print(args.evaluation_output.read_text(encoding="utf-8"), end="")
         return
 
+    teacher_model: nn.Module | None = None
+    teacher_input_device: torch.device | None = None
+    if args.debug:
+        teacher_model_name = args.teacher_model or args.model
+        teacher_model = AutoModelForCausalLM.from_pretrained(
+            teacher_model_name, **load_kwargs
+        )
+        if not use_device_map:
+            teacher_model.to(device)
+        teacher_model.eval()
+        teacher_input_device = teacher_model.get_input_embeddings().weight.device
+        print(f"Student model: {args.model}")
+        print(f"Teacher model: {teacher_model_name}")
+
     def expected_embedding(logits: Tensor, requested_top_k: int) -> Tensor:
         embedding = model.get_input_embeddings()
         top_k = min(requested_top_k, logits.shape[-1])
@@ -830,7 +859,9 @@ def main() -> None:
 
     blocks = find_decoder_blocks(model)
 
-    def step(token: Tensor, cache: DynamicCache) -> tuple[Tensor, DynamicCache]:
+    def model_step(
+        active_model: nn.Module, token: Tensor, cache: DynamicCache
+    ) -> tuple[Tensor, DynamicCache]:
         past_length = cache.get_seq_length()
         token_length = token.shape[1]
         cache_position = torch.arange(
@@ -844,27 +875,76 @@ def main() -> None:
             dtype=torch.long,
             device=token.device,
         )
-        outputs = model(
-            input_ids=token,
-            attention_mask=attention_mask,
-            past_key_values=cache,
-            cache_position=cache_position,
-            use_cache=True,
-            return_dict=True,
-        )
+        with torch.inference_mode():
+            outputs = active_model(
+                input_ids=token,
+                attention_mask=attention_mask,
+                past_key_values=cache,
+                cache_position=cache_position,
+                use_cache=True,
+                return_dict=True,
+            )
         return outputs.logits, outputs.past_key_values
+
+    def student_step(token: Tensor, cache: DynamicCache) -> tuple[Tensor, DynamicCache]:
+        return model_step(model, token, cache)
+
+    def teacher_step(token: Tensor, cache: DynamicCache) -> tuple[Tensor, DynamicCache]:
+        if teacher_model is None or teacher_input_device is None:
+            raise RuntimeError("Teacher inference requires --debug.")
+        return model_step(teacher_model, token.to(teacher_input_device), cache)
 
     eos_token_ids = model.generation_config.eos_token_id
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
     eos_token_ids = set(eos_token_ids or [])
 
+    def distribution_similarity(
+        teacher_logits: Tensor, student_logits: Tensor
+    ) -> dict[str, float | int | str]:
+        if teacher_logits.shape[-1] != student_logits.shape[-1]:
+            raise ValueError(
+                "Teacher and student tokenizers must have the same vocabulary size."
+            )
+        student_prob = torch.softmax(student_logits.float(), dim=-1)
+        teacher_prob = torch.softmax(
+            teacher_logits.to(student_logits.device).float(), dim=-1
+        )
+        midpoint = 0.5 * (teacher_prob + student_prob)
+        teacher_kl = torch.sum(
+            teacher_prob
+            * (torch.log(teacher_prob.clamp_min(1e-12))
+               - torch.log(midpoint.clamp_min(1e-12))),
+            dim=-1,
+        )
+        student_kl = torch.sum(
+            student_prob
+            * (torch.log(student_prob.clamp_min(1e-12))
+               - torch.log(midpoint.clamp_min(1e-12))),
+            dim=-1,
+        )
+        js_divergence = 0.5 * (teacher_kl + student_kl)
+        cosine = torch.nn.functional.cosine_similarity(
+            teacher_prob, student_prob, dim=-1
+        )
+        teacher_top = teacher_prob.argmax(dim=-1)
+        student_top = student_prob.argmax(dim=-1)
+        return {
+            "cosine_similarity": round(float(cosine.item()), 3),
+            "js_similarity": round(float((1.0 - js_divergence / torch.log(
+                torch.tensor(2.0, device=js_divergence.device)
+            )).clamp(0.0, 1.0).item()), 3),
+            "teacher_top_token": tokenizer.decode(teacher_top),
+            "student_top_token": tokenizer.decode(student_top),
+            "top1_agreement": int((teacher_top == student_top).item()),
+        }
+
     def generate(
         use_recirculation: bool,
         run_args: argparse.Namespace,
         run_config: RecirculationConfig,
         expert_shards: TemporalExpertShards | None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, list[dict[str, float | int | str]]]:
         torch.manual_seed(run_args.seed)
         magnitude_diff_stats = MagnitudeDiffStats()
         use_expert_shards = expert_shards is not None and run_args.tempshard
@@ -873,61 +953,187 @@ def main() -> None:
                 expert_shards.select(0)
             else:
                 expert_shards.disable()
-        cache = DynamicCache(config=model.config)
+
+        student_cache = DynamicCache(config=model.config)
         if use_recirculation:
-            cache.activate_past_recording()
+            student_cache.activate_past_recording()
         expected_embedding_fn = (
             (lambda logits: expected_embedding(logits, run_args.exp_emb_K))
             if run_args.exp_emb
             else None
         )
 
-        if use_recirculation:
-            prompt_logits, cache = recirculate(
-                input_ids,
-                blocks=blocks,
-                cache=cache,
-                step=step,
-                rewind_one=rewind_dynamic_cache,
-                config=run_config,
-                select_expert_subset=expert_shards.select if use_expert_shards else None,
-                expected_embedding=expected_embedding_fn,
-                magnitude_diff_stats=magnitude_diff_stats,
-                passes=run_args.passes,
-                rewind_layer=rewind_dynamic_cache_layer,
-            )
-            next_logits = prompt_logits[:, -1, :]
-        else:
-            for position in range(input_ids.shape[1]):
-                token = input_ids[:, position : position + 1]
-                token_logits, cache = step(token, cache)
-            next_logits = token_logits[:, -1, :]
-
-        generated_ids = input_ids.clone()
-        for _ in range(run_args.max_new_tokens):
-            next_token = sample_token(next_logits, run_args.temperature)
-            generated_ids = torch.cat((generated_ids, next_token), dim=1)
-
-            if next_token.item() in eos_token_ids:
-                break
-
+        if not args.debug:
             if use_recirculation:
-                token_logits, cache = recirculate(
-                    next_token,
+                prompt_logits, student_cache = recirculate(
+                    input_ids,
                     blocks=blocks,
-                    cache=cache,
-                    step=step,
+                    cache=student_cache,
+                    step=student_step,
                     rewind_one=rewind_dynamic_cache,
                     config=run_config,
-                    select_expert_subset=expert_shards.select if use_expert_shards else None,
+                    select_expert_subset=(
+                        expert_shards.select if use_expert_shards else None
+                    ),
                     expected_embedding=expected_embedding_fn,
                     magnitude_diff_stats=magnitude_diff_stats,
                     passes=run_args.passes,
                     rewind_layer=rewind_dynamic_cache_layer,
                 )
+                next_logits = prompt_logits[:, -1, :]
             else:
-                token_logits, cache = step(next_token, cache)
-            next_logits = token_logits[:, -1, :]
+                token_logits: Tensor | None = None
+                for position in range(input_ids.shape[1]):
+                    token_logits, student_cache = student_step(
+                        input_ids[:, position : position + 1], student_cache
+                    )
+                assert token_logits is not None
+                next_logits = token_logits[:, -1, :]
+
+            generated_ids = input_ids.clone()
+            for _ in range(run_args.max_new_tokens):
+                next_token = sample_token(next_logits, run_args.temperature)
+                generated_ids = torch.cat((generated_ids, next_token), dim=1)
+                if next_token.item() in eos_token_ids:
+                    break
+                if use_recirculation:
+                    token_logits, student_cache = recirculate(
+                        next_token,
+                        blocks=blocks,
+                        cache=student_cache,
+                        step=student_step,
+                        rewind_one=rewind_dynamic_cache,
+                        config=run_config,
+                        select_expert_subset=(
+                            expert_shards.select if use_expert_shards else None
+                        ),
+                        expected_embedding=expected_embedding_fn,
+                        magnitude_diff_stats=magnitude_diff_stats,
+                        passes=run_args.passes,
+                        rewind_layer=rewind_dynamic_cache_layer,
+                    )
+                else:
+                    token_logits, student_cache = student_step(
+                        next_token, student_cache
+                    )
+                next_logits = token_logits[:, -1, :]
+
+            if use_recirculation and magnitude_diff_stats.mean is not None:
+                print(f"magnitude_diff_stats.mean = {magnitude_diff_stats.mean:.3f}")
+            if use_recirculation and magnitude_diff_stats.projection_means:
+                projection_means = [
+                    round(mean, 3)
+                    for mean in magnitude_diff_stats.projection_means
+                ]
+                print(f"projection_means = {projection_means}")
+            return generated_ids, []
+
+        assert teacher_model is not None
+        # Triton autotuners use process-global caches that are not safe when two
+        # identical FP8 kernels are compiled for the first time concurrently.
+        # Run one throwaway token through each model sequentially before the
+        # teacher and student enter the thread pool.
+        warmup_token = input_ids[:, :1]
+        student_step(warmup_token, DynamicCache(config=model.config))
+        teacher_step(
+            warmup_token,
+            DynamicCache(config=teacher_model.config),
+        )
+        synchronize_devices()
+        teacher_cache = DynamicCache(config=teacher_model.config)
+
+        def student_prefill() -> tuple[Tensor, DynamicCache]:
+            if use_recirculation:
+                return recirculate(
+                    input_ids,
+                    blocks=blocks,
+                    cache=student_cache,
+                    step=student_step,
+                    rewind_one=rewind_dynamic_cache,
+                    config=run_config,
+                    select_expert_subset=(
+                        expert_shards.select if use_expert_shards else None
+                    ),
+                    expected_embedding=expected_embedding_fn,
+                    magnitude_diff_stats=magnitude_diff_stats,
+                    passes=run_args.passes,
+                    rewind_layer=rewind_dynamic_cache_layer,
+                )
+            logits: Tensor | None = None
+            cache = student_cache
+            for position in range(input_ids.shape[1]):
+                logits, cache = student_step(
+                    input_ids[:, position : position + 1], cache
+                )
+            assert logits is not None
+            return logits, cache
+
+        def teacher_prefill() -> tuple[Tensor, DynamicCache]:
+            logits: Tensor | None = None
+            cache = teacher_cache
+            teacher_prompt = input_ids.to(teacher_input_device)
+            for position in range(teacher_prompt.shape[1]):
+                logits, cache = teacher_step(
+                    teacher_prompt[:, position : position + 1], cache
+                )
+            assert logits is not None
+            return logits, cache
+
+        similarities: list[dict[str, float | int | str]] = []
+        generated_ids = input_ids.clone()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            teacher_future = executor.submit(teacher_prefill)
+            student_future = executor.submit(student_prefill)
+            teacher_logits, teacher_cache = teacher_future.result()
+            student_logits, student_cache = student_future.result()
+            teacher_next_logits = teacher_logits[:, -1, :]
+            student_next_logits = student_logits[:, -1, :]
+
+            for token_index in range(run_args.max_new_tokens):
+                comparison = distribution_similarity(
+                    teacher_next_logits, student_next_logits
+                )
+                next_token = sample_token(
+                    student_next_logits, run_args.temperature
+                )
+                comparison.update(
+                    token_index=token_index,
+                    selected_token=tokenizer.decode(next_token[0]),
+                )
+                similarities.append(comparison)
+                generated_ids = torch.cat((generated_ids, next_token), dim=1)
+
+                if next_token.item() in eos_token_ids:
+                    break
+
+                teacher_future = executor.submit(
+                    teacher_step, next_token, teacher_cache
+                )
+                if use_recirculation:
+                    student_future = executor.submit(
+                        recirculate,
+                        next_token,
+                        blocks=blocks,
+                        cache=student_cache,
+                        step=student_step,
+                        rewind_one=rewind_dynamic_cache,
+                        config=run_config,
+                        select_expert_subset=(
+                            expert_shards.select if use_expert_shards else None
+                        ),
+                        expected_embedding=expected_embedding_fn,
+                        magnitude_diff_stats=magnitude_diff_stats,
+                        passes=run_args.passes,
+                        rewind_layer=rewind_dynamic_cache_layer,
+                    )
+                else:
+                    student_future = executor.submit(
+                        student_step, next_token, student_cache
+                    )
+                teacher_logits, teacher_cache = teacher_future.result()
+                student_logits, student_cache = student_future.result()
+                teacher_next_logits = teacher_logits[:, -1, :]
+                student_next_logits = student_logits[:, -1, :]
 
         if use_recirculation and magnitude_diff_stats.mean is not None:
             print(f"magnitude_diff_stats.mean = {magnitude_diff_stats.mean:.3f}")
@@ -936,8 +1142,8 @@ def main() -> None:
                 round(mean, 3) for mean in magnitude_diff_stats.projection_means
             ]
             print(f"projection_means = {projection_means}")
-            
-        return generated_ids
+
+        return generated_ids, similarities
 
     def synchronize_devices() -> None:
         if torch.cuda.is_available():
@@ -946,7 +1152,7 @@ def main() -> None:
 
     def timed_generate(
         use_recirculation: bool, run_args: argparse.Namespace
-    ) -> tuple[Tensor, float]:
+    ) -> tuple[Tensor, list[dict[str, float | int | str]], float]:
         run_config = RecirculationConfig(
             destination=run_args.destination,
             source=resolve_source(run_args.source, len(blocks)),
@@ -983,14 +1189,14 @@ def main() -> None:
         synchronize_devices()
         start = time.perf_counter()
         try:
-            generated_ids = generate(
+            generated_ids, similarities = generate(
                 use_recirculation=use_recirculation,
                 run_args=run_args,
                 run_config=run_config,
                 expert_shards=expert_shards,
             )
             synchronize_devices()
-            return generated_ids, time.perf_counter() - start
+            return generated_ids, similarities, time.perf_counter() - start
         finally:
             if expert_shards is not None:
                 expert_shards.close()
@@ -1021,6 +1227,11 @@ def main() -> None:
         else tuple(EXAMPLE_QUERIES[index - 1] for index in args.query_indices)
     )
     output_file = args.output.open("w", encoding="utf-8") if args.output else None
+    similarities_file = (
+        args.similarities_output.open("w", encoding="utf-8")
+        if args.debug and args.similarities_output
+        else None
+    )
 
     def emit(text: str) -> None:
         print(text)
@@ -1042,7 +1253,7 @@ def main() -> None:
             prompt_length = input_ids.shape[1]
 
             for run_index, (run_args, use_recirculation, label) in enumerate(runs):
-                run_ids, run_seconds = timed_generate(
+                run_ids, similarities, run_seconds = timed_generate(
                     use_recirculation=use_recirculation, run_args=run_args
                 )
                 if run_index == 0:
@@ -1054,9 +1265,22 @@ def main() -> None:
                         run_ids[0, prompt_length:], skip_special_tokens=True
                     )
                 )
+                if similarities_file is not None:
+                    record = {
+                        "prompt": prompt,
+                        "run": label,
+                        "similarities": similarities,
+                    }
+                    print(
+                        json.dumps(record, ensure_ascii=False),
+                        file=similarities_file,
+                    )
+                    similarities_file.flush()
     finally:
         if output_file is not None:
             output_file.close()
+        if similarities_file is not None:
+            similarities_file.close()
 
 
 if __name__ == "__main__":
