@@ -1282,7 +1282,7 @@ def main() -> None:
                 for option, _ in overrides
             )
         )
-        label_options = tuple(dict.fromkeys((*ablated_options, "ortho_mix")))
+        label_options = ablated_options
         baseline_arguments = format_run_arguments(args, label_options)
         runs = [(args, True, f"Baseline: {baseline_arguments}")]
         for overrides in args.ablations:
